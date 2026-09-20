@@ -129,27 +129,32 @@ suspend inline fun <T> useDocumentExtractPageLoader(
         val resumePage = startPage.coerceIn(0, (totalPageCount - 1).coerceAtLeast(0))
 
         // Seed the page the reader will actually show.
-        if (progressiveEngine != null && resumePage >= engine.pageCount) {
-            discoveryMutex.withLock {
-                progressiveEngine.ensureListedThrough(resumePage)
+        val cachedResume = DocumentExtractCache.findCachedPage(cacheKey, resumePage)
+        if (cachedResume != null) {
+            pagePaths[resumePage] = cachedResume
+        } else {
+            if (progressiveEngine != null && resumePage >= engine.pageCount) {
+                discoveryMutex.withLock {
+                    progressiveEngine.ensureListedThrough(resumePage)
+                }
             }
-        }
-        runCatching {
-            extractMutex.withLock {
-                engine.extractToCache(cacheKey, resumePage)?.let { pagePaths[resumePage] = it }
+            runCatching {
+                extractMutex.withLock {
+                    engine.extractToCache(cacheKey, resumePage)?.let { pagePaths[resumePage] = it }
+                }
             }
-        }
-        val seedExt = engine.extOf(resumePage) ?: "bin"
-        if (pagePaths[resumePage] == null && DocumentExtractCache.isPageCached(cacheKey, resumePage, seedExt)) {
-            pagePaths[resumePage] = DocumentExtractCache.pagePath(cacheKey, resumePage, seedExt)
+            val seedExt = engine.extOf(resumePage) ?: "bin"
+            if (pagePaths[resumePage] == null && DocumentExtractCache.isPageCached(cacheKey, resumePage, seedExt)) {
+                pagePaths[resumePage] = DocumentExtractCache.pagePath(cacheKey, resumePage, seedExt)
+            }
         }
 
         // Reuse page 0 for the cover when it is already cached. Do not fetch it ahead
         // of a different resume page just for metadata.
         if (resumePage != 0) {
-            val ext = engine.extOf(0)
-            if (ext != null && DocumentExtractCache.isPageCached(cacheKey, 0, ext)) {
-                pagePaths[0] = DocumentExtractCache.pagePath(cacheKey, 0, ext)
+            val cached0 = DocumentExtractCache.findCachedPage(cacheKey, 0)
+            if (cached0 != null) {
+                pagePaths[0] = cached0
             }
         }
 
@@ -191,13 +196,19 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     requestDiscoveryThrough(resumePage + prefetchN)
                 }
 
-                override fun getImageExtension(index: Int) = engine.extOf(index)
+                override fun getImageExtension(index: Int): String? {
+                    return engine.extOf(index)
+                        ?: pagePaths[index]?.name?.substringAfterLast('.', "")?.takeIf { it.isNotEmpty() }
+                        ?: DocumentExtractCache.findCachedPage(cacheKey, index)?.name?.substringAfterLast('.', "")
+                }
 
                 override fun savePage(index: Int, file: Path): Boolean = runCatching {
-                    val ext = engine.extOf(index) ?: return@runCatching false
                     val path = pagePaths[index]
-                        ?: DocumentExtractCache.pagePath(cacheKey, index, ext)
-                            .takeIf { DocumentExtractCache.isCachedFile(it) }
+                        ?: DocumentExtractCache.findCachedPage(cacheKey, index)
+                        ?: engine.extOf(index)?.let { ext ->
+                            DocumentExtractCache.pagePath(cacheKey, index, ext)
+                                .takeIf { DocumentExtractCache.isCachedFile(it) }
+                        }
                         ?: error("Not cached")
                     pagePaths[index] = path
                     File(path.toString()).copyTo(File(file.toString()), overwrite = true)
@@ -205,12 +216,17 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                 }.getOrDefault(false)
 
                 override fun openSource(index: Int): ImageSource {
-                    val ext = engine.extOf(index) ?: "bin"
                     val path = pagePaths[index]
-                        ?: DocumentExtractCache.pagePath(cacheKey, index, ext)
-                            .takeIf { DocumentExtractCache.isCachedFile(it) }
+                        ?: DocumentExtractCache.findCachedPage(cacheKey, index)
+                        ?: run {
+                            val ext = engine.extOf(index) ?: "bin"
+                            DocumentExtractCache.pagePath(cacheKey, index, ext)
+                                .takeIf { DocumentExtractCache.isCachedFile(it) }
+                        }
                         ?: throw java.io.FileNotFoundException("Document page $index not extracted")
                     pagePaths[index] = path
+                    val ext = path.name.substringAfterLast('.', "").takeIf { it.isNotEmpty() }
+                        ?: engine.extOf(index) ?: "bin"
                     return object : PathSource {
                         override val source: Path = path
                         override val type: String = ext
@@ -271,6 +287,11 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                 /** Disk probe; call only from [Dispatchers.IO]. */
                 private fun probePageOnDisk(index: Int): Boolean {
                     if (pagePaths.containsKey(index)) return true
+                    val cached = DocumentExtractCache.findCachedPage(cacheKey, index)
+                    if (cached != null) {
+                        pagePaths[index] = cached
+                        return true
+                    }
                     val ext = engine.extOf(index) ?: return false
                     val p = DocumentExtractCache.pagePath(cacheKey, index, ext)
                     if (DocumentExtractCache.isCachedFile(p)) {
@@ -343,11 +364,20 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     val job = hostScope.launch(Dispatchers.IO) {
                         try {
                             ensureActive()
+                            if (probePageOnDisk(index)) {
+                                markReady(index)
+                                return@launch
+                            }
                             if (progressiveEngine != null && index >= progressiveEngine.pageCount) {
                                 discoveryMutex.withLock {
                                     ensureActive()
-                                    if (index >= progressiveEngine.pageCount) {
+                                    var discoveryAttempts = 0
+                                    while (index >= progressiveEngine.pageCount && discoveryAttempts++ < 3) {
+                                        ensureActive()
                                         progressiveEngine.ensureListedThrough(index)
+                                        if (index >= progressiveEngine.pageCount && !progressiveEngine.structureComplete) {
+                                            delay(80L * discoveryAttempts)
+                                        }
                                     }
                                 }
                                 growTo(maxOf(totalPageCount, progressiveEngine.pageCount))
@@ -356,26 +386,34 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                                 markReady(index)
                                 return@launch
                             }
-                            if (interactive) {
-                                extractMutex.withLock {
-                                    ensureActive()
-                                    if (!probePageOnDisk(index)) {
-                                        engine.extractToCache(cacheKey, index)?.let { pagePaths[index] = it }
+                            var extractAttempts = 0
+                            while (!probePageOnDisk(index) && extractAttempts++ < 3) {
+                                ensureActive()
+                                if (interactive) {
+                                    extractMutex.withLock {
+                                        ensureActive()
+                                        if (!probePageOnDisk(index)) {
+                                            engine.extractToCache(cacheKey, index)?.let { pagePaths[index] = it }
+                                        }
+                                    }
+                                } else {
+                                    // Background work never queues behind another extraction and
+                                    // never starts while a visible-page request is pending.
+                                    if (interactivePending.isNotEmpty() || !extractMutex.tryLock()) {
+                                        return@launch
+                                    }
+                                    try {
+                                        ensureActive()
+                                        if (interactivePending.isEmpty() && !probePageOnDisk(index)) {
+                                            engine.extractToCache(cacheKey, index)?.let { pagePaths[index] = it }
+                                        }
+                                    } finally {
+                                        extractMutex.unlock()
                                     }
                                 }
-                            } else {
-                                // Background work never queues behind another extraction and
-                                // never starts while a visible-page request is pending.
-                                if (interactivePending.isNotEmpty() || !extractMutex.tryLock()) {
-                                    return@launch
-                                }
-                                try {
-                                    ensureActive()
-                                    if (interactivePending.isEmpty() && !probePageOnDisk(index)) {
-                                        engine.extractToCache(cacheKey, index)?.let { pagePaths[index] = it }
-                                    }
-                                } finally {
-                                    extractMutex.unlock()
+                                if (probePageOnDisk(index)) break
+                                if (interactive && extractAttempts < 3) {
+                                    delay(100L * extractAttempts)
                                 }
                             }
                             if (probePageOnDisk(index)) {

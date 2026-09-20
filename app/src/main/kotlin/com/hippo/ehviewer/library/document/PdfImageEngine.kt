@@ -110,10 +110,23 @@ class PdfImageEngine private constructor(
                 initialDeclaredPageCount = cursor.declaredPageCount
             }
         }
+        var retryCount = 0
         while (pages.size <= index && !cursor.isComplete) {
-            val next = cursor.nextImage() ?: break
-            // A partial disk index can serve its known seek ranges immediately. The
-            // resumed cursor replays that prefix, then appends newly discovered refs.
+            val next = cursor.nextImage()
+            if (next == null) {
+                if (cursor.isComplete) break
+                if (retryCount++ < 3) {
+                    try {
+                        Thread.sleep(50L * retryCount)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    continue
+                } else {
+                    break
+                }
+            }
+            retryCount = 0
             if (cursorImageIndex >= pages.size) {
                 pages += next
             }
@@ -128,25 +141,38 @@ class PdfImageEngine private constructor(
         if (DocumentExtractCache.isPageCached(cacheKey, index, ref.ext)) {
             return DocumentExtractCache.pagePath(cacheKey, index, ref.ext)
         }
-        val bytes = if (ref.hasSeek) {
+        val effectiveRef = if (!ref.hasSeek) {
+            val offset = parser.locateStreamDataOffset(ref.objNum) ?: -1L
+            if (offset >= 0L) {
+                ref.copy(streamOffset = offset).also { updated ->
+                    synchronized(discoveryLock) {
+                        if (index < pages.size && pages[index].objNum == ref.objNum) {
+                            pages[index] = updated
+                        }
+                    }
+                }
+            } else ref
+        } else ref
+
+        val bytes = if (effectiveRef.hasSeek) {
             when (
                 val direct = parser.extractImageBytesAt(
-                    ref.streamOffset,
-                    ref.streamLen,
-                    ref.objNum,
-                    ref.gen,
+                    effectiveRef.streamOffset,
+                    effectiveRef.streamLen,
+                    effectiveRef.objNum,
+                    effectiveRef.gen,
                 )
             ) {
                 is PdfParser.DirectExtractResult.Success -> direct.bytes
                 PdfParser.DirectExtractResult.RetryWithXref -> {
                     // A stale/old index may lack enough object metadata. Rebuild once;
                     // transport failures deliberately do not trigger a duplicate fetch.
-                    if (parser.bootstrap()) parser.extractImageBytes(ref.objNum, ref.gen) else null
+                    if (parser.bootstrap()) parser.extractImageBytes(effectiveRef.objNum, effectiveRef.gen) else null
                 }
                 PdfParser.DirectExtractResult.Failed -> null
             }
         } else {
-            if (parser.bootstrap()) parser.extractImageBytes(ref.objNum, ref.gen) else null
+            if (parser.bootstrap()) parser.extractImageBytes(effectiveRef.objNum, effectiveRef.gen) else null
         } ?: return null
         return DocumentExtractCache.writePage(cacheKey, index, ref.ext, bytes)
     }
@@ -519,7 +545,7 @@ internal class PdfParser(
             filter.isEmpty() -> "png"
             else -> return null // CCITT, JBIG2, etc.
         }
-        val streamOffset = streamDataOffsets[objNum] ?: locateStreamDataOffset(objNum) ?: -1L
+        val streamOffset = streamDataOffsets[objNum] ?: -1L
         return PdfImageEngine.ImageRef(
             objNum = objNum,
             gen = gen,
@@ -535,7 +561,7 @@ internal class PdfParser(
      * File offset of the stream payload for [objNum] using a small header probe
      * (no full image body download during index walk).
      */
-    private fun locateStreamDataOffset(objNum: Int): Long? {
+    internal fun locateStreamDataOffset(objNum: Int): Long? {
         val entry = xref[objNum] ?: return null
         if (entry.free || entry.offset <= 0L) return null
         val probe = readBytes(entry.offset, minOf(16 * 1024, (fileSize - entry.offset).toInt()))
