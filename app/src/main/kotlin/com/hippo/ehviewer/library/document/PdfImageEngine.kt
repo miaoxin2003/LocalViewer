@@ -22,6 +22,7 @@ class PdfImageEngine private constructor(
     private var pageCursor: PdfParser.PageImageCursor? = null,
     structureComplete: Boolean = true,
     private val discoveryAllowed: Boolean = false,
+    private var initialDeclaredPageCount: Int = -1,
 ) : ProgressiveDocumentImageEngine {
 
     data class ImageRef(
@@ -48,6 +49,12 @@ class PdfImageEngine private constructor(
 
     override val pageCount: Int
         get() = synchronized(discoveryLock) { pages.size }
+
+    override val declaredPageCount: Int
+        get() = synchronized(discoveryLock) {
+            val cursorCount = pageCursor?.declaredPageCount ?: -1
+            if (cursorCount > 0) cursorCount else initialDeclaredPageCount
+        }
 
     override val structureComplete: Boolean
         get() = structureCompleteState
@@ -78,6 +85,7 @@ class PdfImageEngine private constructor(
                     offset = p.streamOffset,
                 )
             },
+            declaredPageCount = declaredPageCount,
         )
     }
 
@@ -98,6 +106,9 @@ class PdfImageEngine private constructor(
                 return@synchronized pages.size
             }
             pageCursor = cursor
+            if (initialDeclaredPageCount <= 0 && cursor.declaredPageCount > 0) {
+                initialDeclaredPageCount = cursor.declaredPageCount
+            }
         }
         while (pages.size <= index && !cursor.isComplete) {
             val next = cursor.nextImage() ?: break
@@ -176,6 +187,7 @@ class PdfImageEngine private constructor(
                     pageCursor = cursor,
                     structureComplete = false,
                     discoveryAllowed = true,
+                    initialDeclaredPageCount = cursor.declaredPageCount,
                 )
                 engine.ensureListedThrough(if (progressiveOpen || coverOnly) 0 else Int.MAX_VALUE)
                 logcat("PdfImage") {
@@ -231,7 +243,7 @@ class PdfImageEngine private constructor(
                 }
                 logcat("PdfImage") {
                     "openFromIndex ok pages=${images.size} direct=${images.all { it.hasSeek }} " +
-                        "xref=${parser.xrefCount}"
+                        "declared=${index.declaredPageCount} xref=${parser.xrefCount}"
                 }
                 PdfImageEngine(
                     parser = parser,
@@ -239,6 +251,7 @@ class PdfImageEngine private constructor(
                     remoteSize = size,
                     structureComplete = index.structureComplete,
                     discoveryAllowed = progressive && !index.structureComplete,
+                    initialDeclaredPageCount = index.declaredPageCount,
                 )
             }.onFailure { logcat("PdfImage", it) }.getOrNull()
         }
@@ -559,6 +572,9 @@ internal class PdfParser(
     )
 
     private fun loadStreamObject(objNum: Int, gen: Int): StreamObj? {
+        if (xref.isEmpty()) {
+            bootstrap()
+        }
         val entry = xref[objNum] ?: return null
         if (entry.free || entry.offset <= 0L) {
             // Object stream (PDF 1.5): offset == 0 and gen is index — limited support
@@ -576,6 +592,20 @@ internal class PdfParser(
         }
         val data = readBytes(streamOffset, length.toInt(), requireFull = true) ?: return null
         return StreamObj(dict, data)
+    }
+
+    private fun loadStreamPayload(objNum: Int, gen: Int = 0): ByteArray? {
+        val st = loadStreamObject(objNum, gen) ?: return null
+        var data = st.data
+        for (f in filterNames(st.dict["/Filter"])) {
+            data = when (f) {
+                "/FlateDecode", "/Fl" -> inflate(data) ?: return null
+                "/ASCII85Decode", "/A85" -> ascii85Decode(data) ?: return null
+                "/ASCIIHexDecode", "/AHx" -> asciiHexDecode(data) ?: return null
+                else -> return null
+            }
+        }
+        return data
     }
 
     private fun loadFromObjectStream(_objNum: Int): StreamObj? {
@@ -666,50 +696,121 @@ internal class PdfParser(
         }
         val expected = w.toLong() * h * cs
         if (samples.size.toLong() < expected) return null
-        // CMYK → approximate RGB
-        val bmp = when (cs) {
-            1 -> {
-                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                var p = 0
-                for (y in 0 until h) {
-                    for (x in 0 until w) {
-                        val g = samples[p++].toInt() and 0xff
-                        b.setPixel(x, y, (0xff shl 24) or (g shl 16) or (g shl 8) or g)
+        val csVal = dict["/ColorSpace"]?.let { resolveValue(it) }
+        val isIndexed = csVal is PdfArray && (csVal.items.firstOrNull() as? PdfName)?.name.let { it == "/Indexed" || it == "/I" }
+        val indexedBaseCs = if (isIndexed) {
+            val baseVal = (csVal as PdfArray).items.getOrNull(1)?.let { resolveValue(it) }
+            colorSpaceChannels(baseVal).takeIf { it in 1..4 } ?: 3
+        } else 0
+        val indexedPalette: ByteArray? = if (isIndexed) {
+            val lookupItem = (csVal as PdfArray).items.getOrNull(3)
+            val lookupRef = lookupItem as? PdfRef ?: (lookupItem?.let { resolveValue(it) } as? PdfDict)?.let { d ->
+                d.objNum?.let { PdfRef(it, d.gen) }
+            }
+            when {
+                lookupRef != null -> loadStreamPayload(lookupRef.num, lookupRef.gen)
+                lookupItem is PdfString -> lookupItem.bytes
+                else -> (lookupItem?.let { resolveValue(it) } as? PdfString)?.bytes
+            }
+        } else null
+
+        val bmp = if (isIndexed && indexedPalette != null) {
+            val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            var p = 0
+            val palSize = indexedPalette.size
+            when (indexedBaseCs) {
+                1 -> {
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val idx = samples[p++].toInt() and 0xff
+                            val g = if (idx < palSize) indexedPalette[idx].toInt() and 0xff else 0
+                            b.setPixel(x, y, (0xff shl 24) or (g shl 16) or (g shl 8) or g)
+                        }
                     }
                 }
-                b
-            }
-            3 -> {
-                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                var p = 0
-                for (y in 0 until h) {
-                    for (x in 0 until w) {
-                        val r = samples[p++].toInt() and 0xff
-                        val g = samples[p++].toInt() and 0xff
-                        val bl = samples[p++].toInt() and 0xff
-                        b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                4 -> {
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val idx = samples[p++].toInt() and 0xff
+                            val off = idx * 4
+                            if (off + 3 < palSize) {
+                                val c = (indexedPalette[off].toInt() and 0xff) / 255f
+                                val m = (indexedPalette[off + 1].toInt() and 0xff) / 255f
+                                val ye = (indexedPalette[off + 2].toInt() and 0xff) / 255f
+                                val k = (indexedPalette[off + 3].toInt() and 0xff) / 255f
+                                val r = ((1 - c) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                                val g = ((1 - m) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                                val bl = ((1 - ye) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                                b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                            } else {
+                                b.setPixel(x, y, 0xff shl 24)
+                            }
+                        }
                     }
                 }
-                b
-            }
-            4 -> {
-                val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                var p = 0
-                for (y in 0 until h) {
-                    for (x in 0 until w) {
-                        val c = (samples[p++].toInt() and 0xff) / 255f
-                        val m = (samples[p++].toInt() and 0xff) / 255f
-                        val ye = (samples[p++].toInt() and 0xff) / 255f
-                        val k = (samples[p++].toInt() and 0xff) / 255f
-                        val r = ((1 - c) * (1 - k) * 255).toInt().coerceIn(0, 255)
-                        val g = ((1 - m) * (1 - k) * 255).toInt().coerceIn(0, 255)
-                        val bl = ((1 - ye) * (1 - k) * 255).toInt().coerceIn(0, 255)
-                        b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                else -> {
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val idx = samples[p++].toInt() and 0xff
+                            val off = idx * 3
+                            if (off + 2 < palSize) {
+                                val r = indexedPalette[off].toInt() and 0xff
+                                val g = indexedPalette[off + 1].toInt() and 0xff
+                                val bl = indexedPalette[off + 2].toInt() and 0xff
+                                b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                            } else {
+                                b.setPixel(x, y, 0xff shl 24)
+                            }
+                        }
                     }
                 }
-                b
             }
-            else -> return null
+            b
+        } else {
+            when (cs) {
+                1 -> {
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    var p = 0
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val g = samples[p++].toInt() and 0xff
+                            b.setPixel(x, y, (0xff shl 24) or (g shl 16) or (g shl 8) or g)
+                        }
+                    }
+                    b
+                }
+                3 -> {
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    var p = 0
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val r = samples[p++].toInt() and 0xff
+                            val g = samples[p++].toInt() and 0xff
+                            val bl = samples[p++].toInt() and 0xff
+                            b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                        }
+                    }
+                    b
+                }
+                4 -> {
+                    val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    var p = 0
+                    for (y in 0 until h) {
+                        for (x in 0 until w) {
+                            val c = (samples[p++].toInt() and 0xff) / 255f
+                            val m = (samples[p++].toInt() and 0xff) / 255f
+                            val ye = (samples[p++].toInt() and 0xff) / 255f
+                            val k = (samples[p++].toInt() and 0xff) / 255f
+                            val r = ((1 - c) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                            val g = ((1 - m) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                            val bl = ((1 - ye) * (1 - k) * 255).toInt().coerceIn(0, 255)
+                            b.setPixel(x, y, (0xff shl 24) or (r shl 16) or (g shl 8) or bl)
+                        }
+                    }
+                    b
+                }
+                else -> return null
+            }
         }
         return try {
             val bos = ByteArrayOutputStream()
@@ -741,7 +842,7 @@ internal class PdfParser(
                 "/CalRGB", "/DeviceRGB" -> 3
                 "/CalGray", "/DeviceGray" -> 1
                 "/DeviceCMYK" -> 4
-                "/Indexed" -> 1
+                "/Indexed", "/I" -> 1
                 else -> 0
             }
         }
@@ -1120,6 +1221,9 @@ internal class PdfParser(
     // --- object resolve ---
 
     private fun resolve(ref: PdfRef): PdfValue? {
+        if (xref.isEmpty()) {
+            bootstrap()
+        }
         val key = ref.num
         objCache[key.toLong()]?.let { return it }
         val entry = xref[ref.num]

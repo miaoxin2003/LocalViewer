@@ -105,11 +105,11 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = File("src/main/cpp/CMakeLists.txt")
-        }
-    }
+    // externalNativeBuild {
+    //     cmake {
+    //         path = File("src/main/cpp/CMakeLists.txt")
+    //     }
+    // }
 
     compileOptions {
         isCoreLibraryDesugaringEnabled = true

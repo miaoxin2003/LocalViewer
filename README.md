@@ -45,6 +45,28 @@
   </a>
 </p>
 
+> [!NOTE]
+> **Optimized Edition Notice & Credits**  
+> This repository is an enhanced and optimized fork of [LocalViewer](https://github.com/zmz125000/LocalViewer).  
+> Upstream Repository: [zmz125000/LocalViewer](https://github.com/zmz125000/LocalViewer) | Original Author: [@zmz125000](https://github.com/zmz125000)  
+> Special thanks to @zmz125000 for creating this wonderful open-source comic reader!
+
+## 🚀 Key Optimizations & Enhancements in this Fork
+
+1. **Dual-Page Seamless "Fit Height" Mode**:
+   - Added a "Fit Height" scale mode for dual-page landscape reading. Pages adaptively stretch to match screen height and align seamlessly side-by-side, completely eliminating wide black gaps between/around pages.
+   - Added a quick-toggle button in the bottom reader bar to switch between Fit Width and Fit Height.
+2. **Instant Background GPU Texture Pre-warming (`Bitmap.prepareToDraw`)**:
+   - Bitmaps are now pushed directly to GPU texture memory upon decode in background coroutines. Eliminates the first-frame GPU upload stutter during page flipping.
+3. **Expanded Off-screen Pre-warming Viewport (`beyondViewportPageCount = 2`)**:
+   - Expanded the pre-warm viewport around current pages from 1 to 2 in both horizontal and vertical modes, enabling instant page displays.
+4. **On-Demand PDF Instant Page Jumping**:
+   - Real `declaredPageCount` is now extracted upfront so readers can jump directly to any page (e.g. Page 100 of 200). Target pages are extracted on-demand without waiting for prior pages.
+5. **Decoupled Concurrency Locks**:
+   - Separated extraction and page discovery mutexes so user-visible foreground pages take immediate priority over background indexing.
+6. **Crash Protection & Error Resilience**:
+   - Eliminated hard assertions (`check` / `checkNotNull`) that caused crashes on rapid scrolling or reopening saved reading progress. Wrapped page loaders in `supervisorScope` with boundary safety.
+
 <div align="center">
   <h3>
     <a href="#description">

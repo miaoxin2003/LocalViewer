@@ -31,6 +31,9 @@ interface ProgressiveDocumentImageEngine : DocumentImageEngine {
     /** True only after the page tree has reached a verified end. */
     val structureComplete: Boolean
 
+    /** Declared total page count from document structure (e.g. PDF /Count), or -1 if unknown. */
+    val declaredPageCount: Int get() = -1
+
     /**
      * Discover playable images through [index], or until the page tree ends.
      * Returns the current number of discovered playable pages.

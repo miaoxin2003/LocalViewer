@@ -33,6 +33,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.yield
@@ -60,7 +61,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
     localPathForLibrary: String? = null,
     crossinline block: suspend (PageLoader) -> T,
 ): T = autoCloseScope {
-    coroutineScope {
+    supervisorScope {
         val sizeHint = remoteSize.takeIf { it > 0L }
             ?: runCatching { source.size }.getOrDefault(0L)
         DocumentExtractCache.invalidateIfRemoteSizeMismatch(cacheKey, sizeHint)
@@ -82,7 +83,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     hasAds = hasAds,
                 ),
             )
-            return@coroutineScope block(loader)
+            return@supervisorScope block(loader)
         }
 
         check(sizeHint > 0L) { "Cannot open document (size unknown): $cacheKey" }
@@ -117,34 +118,31 @@ suspend inline fun <T> useDocumentExtractPageLoader(
         val backgroundJobs = ConcurrentHashMap.newKeySet<Int>()
         val interactivePending = ConcurrentHashMap.newKeySet<Int>()
         val extractMutex = Mutex()
+        val discoveryMutex = Mutex()
         val coverWritten = AtomicBoolean(false)
         val discoveryTarget = AtomicInteger(-1)
         val discoveryJob = AtomicReference<Job?>(null)
         val hostScope = this
         val prefetchN = Settings.preloadImage.value.coerceAtLeast(1)
-        val resumePage = startPage.coerceIn(0, (engine.pageCount - 1).coerceAtLeast(0))
+        val declaredTotal = progressiveEngine?.declaredPageCount ?: -1
+        val totalPageCount = if (declaredTotal > 0) declaredTotal else engine.pageCount
+        val resumePage = startPage.coerceIn(0, (totalPageCount - 1).coerceAtLeast(0))
 
-        // Seed the page the reader will actually show. Extracting page 0 first made a
-        // resumed network document pay for two image streams before it could present.
-        extractMutex.withLock {
-            engine.extractToCache(cacheKey, resumePage)?.let { pagePaths[resumePage] = it }
+        // Seed the page the reader will actually show.
+        if (progressiveEngine != null && resumePage >= engine.pageCount) {
+            discoveryMutex.withLock {
+                progressiveEngine.ensureListedThrough(resumePage)
+            }
         }
-        check(
-            pagePaths[resumePage] != null ||
-                DocumentExtractCache.isPageCached(
-                    cacheKey,
-                    resumePage,
-                    engine.extOf(resumePage) ?: "bin",
-                ),
-        ) {
-            "Failed to extract document page $resumePage"
+        runCatching {
+            extractMutex.withLock {
+                engine.extractToCache(cacheKey, resumePage)?.let { pagePaths[resumePage] = it }
+            }
         }
-        pagePaths[resumePage] = pagePaths[resumePage]
-            ?: DocumentExtractCache.pagePath(
-                cacheKey,
-                resumePage,
-                engine.extOf(resumePage) ?: "bin",
-            )
+        val seedExt = engine.extOf(resumePage) ?: "bin"
+        if (pagePaths[resumePage] == null && DocumentExtractCache.isPageCached(cacheKey, resumePage, seedExt)) {
+            pagePaths[resumePage] = DocumentExtractCache.pagePath(cacheKey, resumePage, seedExt)
+        }
 
         // Reuse page 0 for the cover when it is already cached. Do not fetch it ahead
         // of a different resume page just for metadata.
@@ -165,13 +163,13 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     if (gid != null && gid != 0L) {
                         LocalLibrary.updateGalleryPageAndCover(
                             gid,
-                            engine.pageCount,
+                            totalPageCount,
                             resolved?.toString(),
                         )
                     } else {
                         LocalLibrary.updateGalleryPageAndCoverByContentPath(
                             pathStr,
-                            engine.pageCount,
+                            totalPageCount,
                             resolved?.toString(),
                         )
                     }
@@ -184,7 +182,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                 hostScope,
                 info,
                 resumePage,
-                engine.pageCount,
+                totalPageCount,
                 hasAds,
             ) {
                 override val title by lazy { info?.title ?: titleHint }
@@ -211,7 +209,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     val path = pagePaths[index]
                         ?: DocumentExtractCache.pagePath(cacheKey, index, ext)
                             .takeIf { DocumentExtractCache.isCachedFile(it) }
-                    checkNotNull(path) { "Document page $index not extracted" }
+                        ?: throw java.io.FileNotFoundException("Document page $index not extracted")
                     pagePaths[index] = path
                     return object : PathSource {
                         override val source: Path = path
@@ -254,7 +252,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     extractJobs.clear()
                     readyWaiters.clear()
                     // Trust in-memory extract map only — never stat/write on main (onDispose).
-                    val count = engine.pageCount
+                    val count = totalPageCount
                     val structureComplete = progressiveEngine?.structureComplete ?: true
                     val complete = count > 0 &&
                         structureComplete &&
@@ -292,13 +290,13 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                                 if (gid != null && gid != 0L) {
                                     LocalLibrary.updateGalleryPageAndCover(
                                         gid,
-                                        engine.pageCount,
+                                        totalPageCount,
                                         resolved?.toString(),
                                     )
                                 } else {
                                     LocalLibrary.updateGalleryPageAndCoverByContentPath(
                                         pathStr,
-                                        engine.pageCount,
+                                        totalPageCount,
                                         resolved?.toString(),
                                     )
                                 }
@@ -313,7 +311,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     interactive: Boolean,
                     onReady: (() -> Unit)? = null,
                 ) {
-                    if (index !in 0 until engine.pageCount) return
+                    if (index !in 0 until totalPageCount) return
                     if (onReady != null) {
                         readyWaiters.getOrPut(index) { CopyOnWriteArrayList() }.add(onReady)
                         if (isPageMapped(index)) {
@@ -345,6 +343,15 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                     val job = hostScope.launch(Dispatchers.IO) {
                         try {
                             ensureActive()
+                            if (progressiveEngine != null && index >= progressiveEngine.pageCount) {
+                                discoveryMutex.withLock {
+                                    ensureActive()
+                                    if (index >= progressiveEngine.pageCount) {
+                                        progressiveEngine.ensureListedThrough(index)
+                                    }
+                                }
+                                growTo(maxOf(totalPageCount, progressiveEngine.pageCount))
+                            }
                             if (probePageOnDisk(index)) {
                                 markReady(index)
                                 return@launch
@@ -375,7 +382,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                                 markReady(index)
                                 if (
                                     progressiveEngine?.structureComplete ?: true &&
-                                    pagePaths.size >= engine.pageCount
+                                    pagePaths.size >= totalPageCount
                                 ) {
                                     DocumentExtractCache.saveIndexAsync(
                                         engine.toIndex(cacheKey, complete = true),
@@ -415,10 +422,9 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                 /**
                  * Grow a remote PDF only a small distance ahead of actual reading.
                  *
-                 * Unlike TAR stream index (native walk never holds extract mutex), PDF
-                 * discovery shares [extractMutex] with [extractToCache] because [PdfParser]
-                 * is not concurrent-safe. Keep each hold to **one** image page, yield while
-                 * interactive extracts are pending, and persist index async/throttled like TAR.
+                 * Discovery uses [discoveryMutex] while [extractToCache] uses [extractMutex].
+                 * Keep each hold to **one** image page, yield while interactive extracts
+                 * are pending, and persist index async/throttled like TAR.
                  */
                 private fun requestDiscoveryThrough(index: Int) {
                     val progressive = progressiveEngine ?: return
@@ -446,7 +452,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                                     if (before > wanted) break
                                     // One image page per mutex hold so scroll can snatch the lock
                                     // between kids/resource walks (BATCH>1 blocked extract for seconds).
-                                    val after = extractMutex.withLock {
+                                    val after = discoveryMutex.withLock {
                                         ensureActive()
                                         if (interactivePending.isNotEmpty()) {
                                             return@withLock progressive.pageCount
@@ -454,7 +460,7 @@ suspend inline fun <T> useDocumentExtractPageLoader(
                                         progressive.ensureListedThrough(before)
                                     }
                                     if (after > before) {
-                                        growTo(after)
+                                        growTo(maxOf(totalPageCount, after))
                                         val shouldSave = progressive.structureComplete ||
                                             after - lastSavedCount >= PDF_INDEX_SAVE_EVERY ||
                                             after > wanted

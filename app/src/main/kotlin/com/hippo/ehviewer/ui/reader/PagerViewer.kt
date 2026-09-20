@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.VerticalPager
@@ -118,6 +119,7 @@ fun PagerViewer(
                 rightPage = right,
                 pageLoader = pageLoader,
                 isRtl = dualRtl,
+                scaleType = scaleType,
                 layoutSize = layoutSize,
                 navigator = navigator,
                 pagerState = pagerState,
@@ -151,7 +153,7 @@ fun PagerViewer(
         VerticalPager(
             state = pagerState,
             modifier = modifier,
-            beyondViewportPageCount = 1,
+            beyondViewportPageCount = 2,
             userScrollEnabled = canScroll,
             key = { it },
         ) { index ->
@@ -162,7 +164,7 @@ fun PagerViewer(
         HorizontalPager(
             state = pagerState,
             modifier = modifier,
-            beyondViewportPageCount = 1,
+            beyondViewportPageCount = 2,
             reverseLayout = isRtl xor isRtlLayout,
             userScrollEnabled = canScroll,
             key = { it },
@@ -182,6 +184,7 @@ private fun DualPageContainer(
     rightPage: Page?,
     pageLoader: ReaderSession,
     isRtl: Boolean,
+    scaleType: Int,
     layoutSize: Size,
     navigator: () -> NavigationRegions,
     pagerState: PagerState,
@@ -203,14 +206,25 @@ private fun DualPageContainer(
         Size(layoutSize.width / 2f, layoutSize.height)
     }
 
+    val isFitWidth = scaleType == 3
     if (layoutSize != Size.Zero) {
-        // Spread fills the viewport; telephoto zooms the pair as one unit.
-        zoomableState.contentScale = ContentScale.Fit
-        LaunchedEffect(layoutSize) {
+        val leftAspect = leftPage?.layoutAspect?.takeIf { it > 0f } ?: (1 / 1.4125f)
+        val rightAspect = rightPage?.layoutAspect?.takeIf { it > 0f } ?: (1 / 1.4125f)
+        val spreadAspect = if (solo) {
+            (leftPage ?: rightPage)?.layoutAspect?.takeIf { it > 0f } ?: (1 / 1.4125f)
+        } else {
+            leftAspect + rightAspect
+        }
+        val spreadWidth = layoutSize.height * spreadAspect
+        val spreadSize = Size(spreadWidth.coerceAtLeast(1f), layoutSize.height)
+
+        val targetContentScale = if (isFitWidth) ContentScale.FillWidth else ContentScale.Fit
+        zoomableState.contentScale = targetContentScale
+        LaunchedEffect(layoutSize, isFitWidth, spreadSize) {
             zoomableState.setContentLocation(
-                ZoomableContentLocation.scaledInsideAndCenterAligned(layoutSize),
+                ZoomableContentLocation.scaledInsideAndCenterAligned(spreadSize),
             )
-            zoomableState.contentAlignment = Alignment.Center
+            zoomableState.contentAlignment = if (isFitWidth) Alignment.TopCenter else Alignment.Center
         }
     }
 
@@ -255,7 +269,14 @@ private fun DualPageContainer(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(onTap) {
+                detectTapGestures(onLongPress = onLongClick, onTap = onTap.partially1(null))
+            },
+        contentAlignment = Alignment.Center,
+    ) {
         val zoomMod = Modifier.zoomable(
             state = zoomableState,
             onClick = onTap.partially1(zoomableState),
@@ -278,31 +299,28 @@ private fun DualPageContainer(
         } else {
             Row(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .pointerInput(onTap) {
-                        detectTapGestures(onLongPress = onLongClick, onTap = onTap.partially1(null))
-                    }
+                    .fillMaxHeight()
+                    .wrapContentWidth()
                     .then(zoomMod),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                    if (leftPage != null) {
-                        PagerItem(
-                            page = leftPage,
-                            pageLoader = pageLoader,
-                            contentScale = ContentScale.Fit,
-                            viewportSize = halfSize,
-                        )
-                    }
+                if (leftPage != null) {
+                    PagerItem(
+                        page = leftPage,
+                        pageLoader = pageLoader,
+                        contentScale = ContentScale.Fit,
+                        viewportSize = halfSize,
+                        horizontalStrip = true,
+                    )
                 }
-                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                    if (rightPage != null) {
-                        PagerItem(
-                            page = rightPage,
-                            pageLoader = pageLoader,
-                            contentScale = ContentScale.Fit,
-                            viewportSize = halfSize,
-                        )
-                    }
+                if (rightPage != null) {
+                    PagerItem(
+                        page = rightPage,
+                        pageLoader = pageLoader,
+                        contentScale = ContentScale.Fit,
+                        viewportSize = halfSize,
+                        horizontalStrip = true,
+                    )
                 }
             }
         }

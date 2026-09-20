@@ -77,6 +77,7 @@ object DocumentExtractCache {
         /** True after all document pages have been inspected for playable images. */
         val structureComplete: Boolean = true,
         val members: List<Member> = emptyList(),
+        val declaredPageCount: Int = -1,
     )
 
     /** Minimum [Index.v] trusted for openFromIndex / complete-and-ready. */

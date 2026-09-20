@@ -190,6 +190,21 @@ class Image private constructor(
             this.src?.close()
             this.src = null
         }
+        val bm = when (image) {
+            is BitmapImageWithExtraInfo -> image.image.bitmap
+            is BitmapImage -> image.bitmap
+            else -> null
+        }
+        bm?.prepareToDraw()
+    }
+
+    fun prepareToDraw() {
+        val bm = when (val img = innerImage) {
+            is BitmapImageWithExtraInfo -> img.image.bitmap
+            is BitmapImage -> img.bitmap
+            else -> null
+        }
+        bm?.prepareToDraw()
     }
 
     private fun bitmapIsWideGamut(image: CoilImage): Boolean {

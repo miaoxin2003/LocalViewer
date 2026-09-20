@@ -37,6 +37,29 @@
   </a>
 </p>
 
+> [!NOTE]
+> **优化版本声明与致谢**  
+> 本项目为 [LocalViewer](https://github.com/zmz125000/LocalViewer) 的深度体验与性能优化 Fork 版本。  
+> 原项目地址：[zmz125000/LocalViewer](https://github.com/zmz125000/LocalViewer) | 原作者：[@zmz125000](https://github.com/zmz125000)  
+> 非常感谢原作者 @zmz125000 打造的优秀开源项目！
+
+## 🚀 本分支优化与新增特性清单
+
+1. **双页黑缝消除与适应高度模式 (Fit Height Dual-Page)**：
+   - 新增“适应高度 (Fit Height)”缩放模式：在横屏平着看双页漫画时，图片自动垂直撑满屏幕高度，并保持左右两页无缝贴合对齐，彻底消除了原版左右两侧过宽的黑缝困扰。
+   - 底部控制栏增加一键切换按钮，可在“适应宽度”与“适应高度”之间快速切换。
+2. **真·后台即时 GPU 纹理预热 (`Bitmap.prepareToDraw`)**：
+   - 深入阅读器底层，在后台图片解码完成时直接调用 Android 底层 `Bitmap.prepareToDraw()` 将位图推入 GPU 硬件纹理缓存。彻底消除翻页瞬间主线程上传纹理掉帧卡顿的问题，实现丝滑翻页。
+3. **增大离屏视窗预热缓存 (`beyondViewportPageCount = 2`)**：
+   - 将 Pager 阅读器的视窗前后预热页面数量从 1 提升至 2，配合后台纹理准备，无论普通翻页还是快速连续翻页，下一页内容均已就绪，实现零延迟翻页秒显。
+4. **PDF 任意页码秒级跳跃与按需抽取 (`on-demand page extraction`)**：
+   - 重构 PDF 解析与分页架构：直接解析 PDF 文件真实的 `declaredPageCount`（如 200 页），摆脱过去只能在后台已抽取的前几十页内翻动的严重限制。
+   - 用户拖动进度条跳转至第 100 页时，底层立即精准按需抽取第 100 页数据并实时渲染，无需等待前面页面逐一抽取。
+5. **解耦 PDF 解压与页码探测并发锁**：
+   - 拆分 `extractMutex` 与 `discoveryMutex`，用户前台急需浏览的页面享受最高抽取优先级，不再被后台耗时的顺序遍历阻塞。
+6. **消除应用崩溃与退出重开闪退隐患**：
+   - 全面排查并移除了快速翻页、应用重开恢复阅读历史时的硬断言崩溃异常（`check` / `checkNotNull`），增加 `supervisorScope` 与安全边界防护，杜绝闪退。
+
 <div align="center">
   <h3>
     <a href="#描述">

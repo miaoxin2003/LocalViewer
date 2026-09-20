@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.ui.reader
 
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.size
@@ -7,6 +8,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Height
+import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExposedDropdownMenuAnchorType
@@ -24,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -66,6 +70,20 @@ fun BottomReaderBar(
         },
         imageVector = autoRotate.icon,
         contentDescription = stringResource(autoRotate.stringRes),
+    )
+    // 3. Scale mode (Fit Height vs Fit Width toggle)
+    val context = LocalContext.current
+    val scaleType by Settings.imageScaleType.collectAsState()
+    val isFitWidth = scaleType == 3
+    ActionButton(
+        onClick = {
+            val newScale = if (isFitWidth) 4 else 3
+            Settings.imageScaleType.value = newScale
+            val text = context.getString(if (newScale == 3) R.string.scale_type_fit_width else R.string.scale_type_fit_height)
+            Toast.makeText(context, text, Toast.LENGTH_SHORT).show()
+        },
+        imageVector = if (isFitWidth) Icons.Default.SwapHoriz else Icons.Default.Height,
+        contentDescription = stringResource(if (isFitWidth) R.string.scale_type_fit_width else R.string.scale_type_fit_height),
     )
     // 3. Photo grid (folder / ZIP) or decode size
     if (onClickPhotoGrid != null) {

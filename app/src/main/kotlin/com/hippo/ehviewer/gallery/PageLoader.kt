@@ -189,6 +189,7 @@ abstract class PageLoader(
                             forceOriginal = forceOriginal,
                         )
                     }
+                image.prepareToDraw()
                 // Compressed ramPages are only needed until decode. Keep them while this
                 // index is still demanded (save / retry); drop as soon as the bitmap exists
                 // if navigation already moved on.
