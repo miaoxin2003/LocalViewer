@@ -1,0 +1,951 @@
+package com.hippo.ehviewer.webdav
+
+import com.ehviewer.core.database.model.WebDavSourceEntity
+import com.ehviewer.core.util.logcat
+import com.ehviewer.core.util.withIOContext
+import com.hippo.ehviewer.Settings
+import com.hippo.ehviewer.library.BrowseEntryRemote
+import com.hippo.ehviewer.library.BrowseSession
+import com.hippo.ehviewer.library.FolderGalleryIndex
+import com.hippo.ehviewer.library.FolderSearch
+import com.hippo.ehviewer.library.NetworkFolderIndexCache
+import com.hippo.ehviewer.library.RemoteChild
+import com.hippo.ehviewer.library.RemoteDirectorySlimPlan
+import com.hippo.ehviewer.library.SMB_PROMOTE_MAX_LEAVES
+import com.hippo.ehviewer.library.ZipAsDirListing
+import com.hippo.ehviewer.library.ZipCdParse
+import com.hippo.ehviewer.library.ZipCentralDirectory
+import com.hippo.ehviewer.library.classifyRemoteListing
+import com.hippo.ehviewer.library.classifyRemoteListingWithPeeks
+import com.hippo.ehviewer.library.hiddenDirectoriesNeedingDeepScan
+import com.hippo.ehviewer.library.isDotHiddenName
+import com.hippo.ehviewer.library.isPromotableLeafDirName
+import com.hippo.ehviewer.library.isProtectedSystemName
+import com.hippo.ehviewer.library.isShallowIncompleteListing
+import com.hippo.ehviewer.library.isUntrustedSlimLiveListing
+import com.hippo.ehviewer.library.isZipArchiveFileName
+import com.hippo.ehviewer.library.mergeRemoteDirectorySlimRefresh
+import com.hippo.ehviewer.library.peekIndicatesHiddenDir
+import com.hippo.ehviewer.library.planRemoteDirectorySlimRefresh
+import com.hippo.ehviewer.library.preferCompleteFolderGalleries
+import com.hippo.ehviewer.library.replaceSlimDirectFilesFromLive
+import com.hippo.ehviewer.library.selectCachedFolderListing
+import com.hippo.ehviewer.library.withHiddenFlags
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+
+/**
+ * Browse listing for WebDAV: PROPFIND + parallel peeks + same remote classify as SMB.
+ * No TCP session pool — HTTP multiplexes; peek fan-out follows Advanced →
+ * WebDAV concurrent listing ([Settings.webDavConcurrentListing]).
+ */
+object WebDavGateway {
+    /** Deep peek/classify budget after shallow paint; keep shallow on expiry. */
+    private const val DEEP_CLASSIFY_TIMEOUT_MS = 180_000L
+
+    private const val PEEK_CONCURRENCY_MAX = 7
+
+    /** Subfolder PROPFIND / zip-root fan-out. Advanced → WebDAV concurrent listing. */
+    private fun peekConcurrency(): Int = Settings.webDavConcurrentListing.value.coerceIn(3, PEEK_CONCURRENCY_MAX)
+
+    fun sourceConfigKey(source: WebDavSourceEntity): String = "${source.id}|${source.baseUrl}|${source.pathPrefix}|${source.username}"
+
+    fun joinRelative(parent: String, child: String): String {
+        val p = parent.replace('\\', '/').trim('/')
+        val c = child.replace('\\', '/').trim('/')
+        return when {
+            p.isEmpty() -> c
+            c.isEmpty() -> p
+            else -> "$p/$c"
+        }
+    }
+
+    fun isListing(sourceId: Long, relativeDir: String): Boolean = isListJobActive(BrowseSession.webDavListingKey(sourceId, relativeDir))
+
+    suspend fun listDirectory(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        useCache: Boolean = true,
+        onCached: ((List<BrowseEntryRemote>) -> Unit)? = null,
+        onRefreshDone: (() -> Unit)? = null,
+    ): List<BrowseEntryRemote> {
+        if (Settings.browseZipAsDir.value) {
+            ZipAsDirListing.splitZipBrowsePath(relativeDir)?.let { (zipRel, inner) ->
+                return listZipVirtualDirectory(
+                    source,
+                    password,
+                    relativeDir,
+                    zipRel,
+                    inner,
+                    useCache,
+                    onCached,
+                )
+            }
+        }
+        val configKey = sourceConfigKey(source)
+        val jobKey = BrowseSession.webDavListingKey(source.id, relativeDir)
+        if (useCache && isListJobActive(jobKey)) {
+            BrowseSession.getWebDavCachedListing(source.id, relativeDir)?.let { ram ->
+                val painted = presentListingForZipAsDirToggle(
+                    source,
+                    configKey,
+                    relativeDir,
+                    ram.entries,
+                    ram.sessionCurrent,
+                )
+                publishCachedOnMain(painted, onCached)
+                if (!isShallowIncompleteListing(ram.entries)) {
+                    return painted
+                }
+            }
+            return awaitListJob(jobKey) {
+                error("joined in-flight WebDAV list job")
+            }
+        }
+        if (useCache) {
+            val ram = BrowseSession.getWebDavCachedListing(source.id, relativeDir)
+            val needDisk = ram == null ||
+                !ram.sessionCurrent ||
+                isShallowIncompleteListing(ram.entries)
+            val disk = if (needDisk) {
+                NetworkFolderIndexCache.loadWebDav(source.id, configKey, relativeDir)
+            } else {
+                null
+            }
+            val selected = selectCachedFolderListing(
+                ramEntries = ram?.entries,
+                ramSessionCurrent = ram?.sessionCurrent == true,
+                diskEntries = disk,
+            )
+            val cached = selected?.let { (entries, sessionCurrent) ->
+                if (ram == null || ram.entries !== entries || ram.sessionCurrent != sessionCurrent) {
+                    BrowseSession.putWebDavListing(
+                        source.id,
+                        relativeDir,
+                        entries,
+                        sessionCurrent = sessionCurrent,
+                    )
+                }
+                BrowseSession.CachedRemoteListing(entries = entries, sessionCurrent = sessionCurrent)
+            }
+            if (cached != null) {
+                val presented = presentListingForZipAsDirToggle(
+                    source,
+                    configKey,
+                    relativeDir,
+                    cached.entries,
+                    cached.sessionCurrent,
+                )
+                publishCachedOnMain(presented, onCached)
+                val shouldQuickScan =
+                    Settings.networkFolderIndexQuickScan.value && !cached.sessionCurrent
+                if (!shouldQuickScan) return presented
+                if (isShallowIncompleteListing(cached.entries)) {
+                    return listDirectoryShallowThenDeep(
+                        source,
+                        password,
+                        relativeDir,
+                        configKey,
+                        onCached,
+                    )
+                }
+                startListJob(jobKey) {
+                    try {
+                        val refresh = listDirectorySlim(
+                            source,
+                            password,
+                            relativeDir,
+                            cached.entries,
+                            configKey,
+                        )
+                        if (!refresh.persist) {
+                            logcat("FolderIndex") {
+                                "WebDAV slim ignored untrusted listing for source=${source.id} " +
+                                    "dir=$relativeDir; keeping cache"
+                            }
+                            return@startListJob presented
+                        }
+                        val toKeep = if (refresh.persist &&
+                            (refresh.entries != cached.entries || refresh.zipInteriors.isNotEmpty())
+                        ) {
+                            persistParentAndZipInteriors(
+                                source,
+                                configKey,
+                                relativeDir,
+                                refresh.entries,
+                                refresh.zipInteriors,
+                            )
+                        } else {
+                            refresh.entries
+                        }
+                        val slimmed = presentListingForZipAsDirToggle(
+                            source,
+                            configKey,
+                            relativeDir,
+                            toKeep,
+                            sessionCurrent = true,
+                            previousForZipNames = cached.entries,
+                        )
+                        publishCachedOnMain(slimmed, onCached)
+                        slimmed
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        // Leave non-current so a later visit can retry quick scan.
+                        presented
+                    } finally {
+                        publishRefreshDoneOnMain(onRefreshDone)
+                    }
+                }
+                return presented
+            }
+        } else {
+            listJobs.remove(jobKey)?.cancel()
+            BrowseSession.invalidateWebDavListing(source.id, relativeDir)
+        }
+        // Cold miss: shallow-first (one PROPFIND → paint), then deferred peeks.
+        return listDirectoryShallowThenDeep(source, password, relativeDir, configKey, onCached)
+    }
+
+    private val listingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val listJobs = ConcurrentHashMap<String, Deferred<List<BrowseEntryRemote>>>()
+
+    private fun isListJobActive(key: String): Boolean = listJobs[key]?.isActive == true
+
+    private fun startListJob(
+        key: String,
+        loader: suspend () -> List<BrowseEntryRemote>,
+    ) {
+        ensureListJob(key, loader)
+    }
+
+    private suspend fun awaitListJob(
+        key: String,
+        loader: suspend () -> List<BrowseEntryRemote>,
+    ): List<BrowseEntryRemote> {
+        val deferred = ensureListJob(key, loader)
+        return try {
+            deferred.await()
+        } catch (e: CancellationException) {
+            coroutineContext.ensureActive()
+            throw e
+        }
+    }
+
+    private fun ensureListJob(
+        key: String,
+        loader: suspend () -> List<BrowseEntryRemote>,
+    ): Deferred<List<BrowseEntryRemote>> = listJobs.compute(key) { _, existing ->
+        if (existing != null && existing.isActive) {
+            existing
+        } else {
+            existing?.cancel()
+            listingScope.async { loader() }.also { job ->
+                job.invokeOnCompletion { listJobs.remove(key, job) }
+            }
+        }
+    }!!
+
+    private suspend fun publishCachedOnMain(
+        entries: List<BrowseEntryRemote>,
+        onCached: ((List<BrowseEntryRemote>) -> Unit)?,
+    ) {
+        if (onCached == null) return
+        withContext(Dispatchers.Main.immediate) {
+            onCached(entries)
+        }
+    }
+
+    private suspend fun publishRefreshDoneOnMain(onRefreshDone: (() -> Unit)?) {
+        if (onRefreshDone == null) return
+        withContext(Dispatchers.Main.immediate) {
+            onRefreshDone()
+        }
+    }
+
+    /**
+     * Cold list: publish name-only shallow rows immediately, then peek/classify.
+     * Deep failure / timeout / cancel keeps shallow (`sessionCurrent=false`).
+     */
+    private suspend fun listDirectoryShallowThenDeep(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        configKey: String,
+        onCached: ((List<BrowseEntryRemote>) -> Unit)?,
+    ): List<BrowseEntryRemote> {
+        val previous = BrowseSession.getWebDavListing(source.id, relativeDir)
+        val t0 = System.nanoTime()
+        val children = withIOContext {
+            listChildrenForRelativeDir(source, password, relativeDir)
+        }
+        val dirName = relativeDir.substringAfterLast('/').ifEmpty { source.displayName }
+        val shallowChildren = if (Settings.browseZipAsDir.value) {
+            ZipAsDirListing.zipFilesAsPendingDirectories(children)
+        } else {
+            children
+        }
+        val shallow = classifyRemoteListing(dirName, shallowChildren.withHiddenFlags())
+        val shallowMerged = if (previous != null) {
+            preferCompleteFolderGalleries(previous, shallow)
+        } else {
+            shallow
+        }
+        // RAM-only until deep succeeds (same reason as SMB — avoid slim false-complete).
+        BrowseSession.putWebDavListing(
+            source.id,
+            relativeDir,
+            shallowMerged,
+            sessionCurrent = false,
+        )
+        logcat("FolderIndex") {
+            "WebDAV shallow list source=${source.id} dir=$relativeDir " +
+                "children=${children.size} entries=${shallowMerged.size} " +
+                "ms=${(System.nanoTime() - t0) / 1_000_000}"
+        }
+        publishCachedOnMain(shallowMerged, onCached)
+
+        BrowseSession.getWebDavCachedListing(source.id, relativeDir)?.let { cached ->
+            if (cached.sessionCurrent) return cached.entries
+        }
+
+        return try {
+            withTimeout(DEEP_CLASSIFY_TIMEOUT_MS) {
+                coroutineContext.ensureActive()
+                val t1 = System.nanoTime()
+                val zipInteriors = ConcurrentHashMap<String, List<BrowseEntryRemote>>()
+                val deep = withIOContext {
+                    classifyDirectoryChildren(
+                        source,
+                        password,
+                        relativeDir,
+                        children,
+                        zipInteriors,
+                        onPartial = { partial ->
+                            val merged = preferCompleteFolderGalleries(shallowMerged, partial)
+                            BrowseSession.putWebDavListing(
+                                source.id,
+                                relativeDir,
+                                merged,
+                                sessionCurrent = false,
+                            )
+                            onCached?.invoke(merged)
+                        },
+                    )
+                }
+                val fromRam = preferCompleteFolderGalleries(shallowMerged, deep)
+                val zipOn = Settings.browseZipAsDir.value
+                val presented = presentListingForZipAsDirToggle(
+                    source,
+                    configKey,
+                    relativeDir,
+                    fromRam,
+                    sessionCurrent = true,
+                    previousForZipNames = shallowMerged,
+                    persist = !zipOn,
+                )
+                val stored = if (zipOn) {
+                    val kept = persistParentAndZipInteriors(
+                        source,
+                        configKey,
+                        relativeDir,
+                        presented,
+                        zipInteriors,
+                    )
+                    BrowseSession.putWebDavListing(
+                        source.id,
+                        relativeDir,
+                        kept,
+                        sessionCurrent = true,
+                    )
+                    kept
+                } else {
+                    presented
+                }
+                logcat("FolderIndex") {
+                    "WebDAV deep classify source=${source.id} dir=$relativeDir " +
+                        "entries=${stored.size} ms=${(System.nanoTime() - t1) / 1_000_000}"
+                }
+                stored
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: TimeoutCancellationException) {
+            logcat("FolderIndex") {
+                "WebDAV deep classify timed out source=${source.id} dir=$relativeDir; keeping shallow"
+            }
+            shallowMerged
+        } catch (e: Throwable) {
+            logcat("FolderIndex") {
+                "WebDAV deep classify failed source=${source.id} dir=$relativeDir " +
+                    "(${e.message}); keeping shallow"
+            }
+            shallowMerged
+        }
+    }
+
+    private data class SlimDirectoryRefresh(
+        val entries: List<BrowseEntryRemote>,
+        val removedDirectoryNames: Set<String>,
+        val persist: Boolean = true,
+        val zipInteriors: Map<String, List<BrowseEntryRemote>> = emptyMap(),
+    )
+
+    private suspend fun listDirectoryUncached(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+    ): List<BrowseEntryRemote> {
+        val children = listChildrenForRelativeDir(source, password, relativeDir)
+        return classifyDirectoryChildren(source, password, relativeDir, children)
+    }
+
+    /**
+     * Flat non-directory child basenames (one PROPFIND, no classify / peeks).
+     * Used by HTTP access-dir so folder playlists match the real remote directory.
+     */
+    suspend fun listChildFileNames(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+    ): List<String> = withIOContext {
+        if (ZipAsDirListing.splitZipBrowsePath(relativeDir) != null) return@withIOContext emptyList()
+        WebDavClient.listChildren(source, password, relativeDir)
+            .asSequence()
+            .filterNot { it.isDirectory || it.name.startsWith('.') || isProtectedSystemName(it.name) }
+            .map { it.name }
+            .toList()
+    }
+
+    /**
+     * Flat child files and directories (one PROPFIND, no classify / peeks).
+     * Used by HTML loopback HTTP to serve a folder tree.
+     */
+    suspend fun listChildFilesAndDirs(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+    ): Pair<List<String>, List<String>> = withIOContext {
+        if (ZipAsDirListing.splitZipBrowsePath(relativeDir) != null) {
+            return@withIOContext emptyList<String>() to emptyList()
+        }
+        val children = WebDavClient.listChildren(source, password, relativeDir)
+        val files = ArrayList<String>()
+        val dirs = ArrayList<String>()
+        for (child in children) {
+            if (child.name.startsWith('.') || isProtectedSystemName(child.name)) continue
+            if (child.isDirectory) dirs += child.name else files += child.name
+        }
+        files.sorted() to dirs.sorted()
+    }
+
+    /**
+     * Cache-hit refresh: one PROPFIND for the current directory. Only new child folders
+     * run the existing child/leaf peek classifier. Direct files are reconciled
+     * (drop stale / add new) from the live listing.
+     */
+    private suspend fun listDirectorySlim(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        cached: List<BrowseEntryRemote>,
+        configKey: String,
+    ): SlimDirectoryRefresh {
+        val children = listChildrenForRelativeDir(source, password, relativeDir)
+        if (isUntrustedSlimLiveListing(cached, children)) {
+            return SlimDirectoryRefresh(cached, emptySet(), persist = false)
+        }
+        val plan = planRemoteDirectorySlimRefresh(cached, children)
+        val zipFileNames = if (Settings.browseZipAsDir.value) {
+            ZipAsDirListing.zipFileNames(children)
+        } else {
+            emptySet()
+        }
+        val deepHidden = if (com.hippo.ehviewer.Settings.browseShowHiddenFiles.value) {
+            hiddenDirectoriesNeedingDeepScan(cached, children)
+        } else {
+            emptyList()
+        }
+        val deepNames = deepHidden.mapTo(HashSet()) { it.name }
+        val cachedZipAsDir = if (zipFileNames.isEmpty()) {
+            emptySet()
+        } else {
+            ZipAsDirListing.cachedDirectZipAsDirNames(cached)
+        }
+        val newZips = if (zipFileNames.isEmpty()) {
+            emptyList()
+        } else {
+            children.filter { it.name in zipFileNames && it.name !in cachedZipAsDir }
+        }
+        val toClassify = (plan.addedDirectories + deepHidden + newZips).distinctBy { it.name }
+        val dirName = relativeDir.substringAfterLast('/').ifEmpty { source.displayName }
+        val zipAdjustedUnreachable = plan.unreachableDirectoryNames - zipFileNames
+        val recovered = plan.recoveredDirectoryNames
+        val dirsUnchanged = plan.addedDirectories.isEmpty() &&
+            zipAdjustedUnreachable.isEmpty() &&
+            recovered.isEmpty()
+        if (dirsUnchanged && deepHidden.isEmpty() && newZips.isEmpty()) {
+            return SlimDirectoryRefresh(
+                entries = replaceSlimDirectFilesFromLive(cached, children, dirName),
+                removedDirectoryNames = emptySet(),
+            )
+        }
+        val effectivePlan = RemoteDirectorySlimPlan(
+            addedDirectories = toClassify,
+            removedDirectoryNames = deepNames,
+            unreachableDirectoryNames = zipAdjustedUnreachable,
+            recoveredDirectoryNames = recovered,
+        )
+        val zipInteriors = ConcurrentHashMap<String, List<BrowseEntryRemote>>()
+        val addedEntries = if (toClassify.isEmpty()) {
+            emptyList()
+        } else {
+            classifyDirectoryChildren(source, password, relativeDir, toClassify, zipInteriors)
+        }
+        val merged = replaceSlimDirectFilesFromLive(
+            mergeRemoteDirectorySlimRefresh(cached, effectivePlan, addedEntries),
+            children,
+            dirName,
+        )
+        return SlimDirectoryRefresh(
+            entries = merged,
+            removedDirectoryNames = emptySet(),
+            zipInteriors = zipInteriors,
+        )
+    }
+
+    private suspend fun classifyDirectoryChildren(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        children: List<RemoteChild>,
+        zipInteriors: MutableMap<String, List<BrowseEntryRemote>>? = null,
+        onPartial: (suspend (List<BrowseEntryRemote>) -> Unit)? = null,
+    ): List<BrowseEntryRemote> {
+        val deepScanHidden = com.hippo.ehviewer.Settings.browseShowHiddenFiles.value
+        // Dot folders: always tag-only (never peek). `.nomedia` dirs peek only when Hidden on.
+        val dirsToPeek = children.filter { c ->
+            c.isDirectory &&
+                !isProtectedSystemName(c.name) &&
+                !isDotHiddenName(c.name) &&
+                (deepScanHidden || !c.hidden)
+        }
+        val peeks = ConcurrentHashMap<String, List<RemoteChild>>()
+        val gate = Semaphore(peekConcurrency())
+        if (dirsToPeek.isNotEmpty()) {
+            coroutineScope {
+                dirsToPeek.map { c ->
+                    async {
+                        gate.withPermit {
+                            val childRel = joinRelative(relativeDir, c.name)
+                            peeks[c.name] = runCatching {
+                                listChildrenForRelativeDir(source, password, childRel)
+                            }.getOrDefault(emptyList())
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+
+        val grandPeeks = ConcurrentHashMap<String, List<RemoteChild>>()
+        val leavesToPeek = ArrayList<Pair<String, String>>()
+        for ((subName, peek) in peeks) {
+            // First peek already ran (needed for `.nomedia` detection). Skip grandchild
+            // scans into hidden dirs when Hidden files is off.
+            if (!deepScanHidden && peekIndicatesHiddenDir(subName, peek)) continue
+            // sample/ does not count toward the 1..3 leaf budget or grand-peek work.
+            val leaves = peek.filter { it.isDirectory && isPromotableLeafDirName(it.name) }
+            if (leaves.size in 1..SMB_PROMOTE_MAX_LEAVES) {
+                for (leaf in leaves) {
+                    leavesToPeek += subName to leaf.name
+                }
+            } else if (leaves.isNotEmpty()) {
+                // Cover-only: first leaf when promote budget exceeded.
+                leavesToPeek += subName to leaves.first().name
+            }
+        }
+        if (leavesToPeek.isNotEmpty()) {
+            coroutineScope {
+                leavesToPeek.map { (subName, leafName) ->
+                    async {
+                        gate.withPermit {
+                            val leafRel = joinRelative(joinRelative(relativeDir, subName), leafName)
+                            grandPeeks["$subName/$leafName"] = runCatching {
+                                listChildrenForRelativeDir(source, password, leafRel)
+                            }.getOrDefault(emptyList())
+                        }
+                    }
+                }.awaitAll()
+            }
+        }
+
+        val dirName = relativeDir.substringAfterLast('/').ifEmpty { source.displayName }
+        val zipListings = if (Settings.browseZipAsDir.value &&
+            children.any { !it.isDirectory && isZipArchiveFileName(it.name) }
+        ) {
+            if (onPartial != null) {
+                val nonZip = children.filter { it.isDirectory || !isZipArchiveFileName(it.name) }
+                val partial = classifyRemoteListingWithPeeks(
+                    dirName,
+                    nonZip,
+                    peeks,
+                    grandPeeks,
+                ) + ZipAsDirListing.pendingZipDirectoryRows(children)
+                onPartial(partial)
+            }
+            zipRootListings(source, password, relativeDir, children, zipInteriors)
+        } else {
+            emptyMap()
+        }
+        return ZipAsDirListing.classifyListingWithZipAsDirs(
+            currentDirName = dirName,
+            children = children,
+            childPeeks = peeks,
+            grandPeeks = grandPeeks,
+        ) { zipListings[it] }
+    }
+
+    private suspend fun listZipVirtualDirectory(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        zipRel: String,
+        inner: String,
+        useCache: Boolean,
+        onCached: ((List<BrowseEntryRemote>) -> Unit)?,
+    ): List<BrowseEntryRemote> {
+        val configKey = sourceConfigKey(source)
+        val zipName = zipRel.substringAfterLast('/')
+        val parentRel = ZipAsDirListing.parentRelative(zipRel)
+        val parentEntries = BrowseSession.getWebDavListing(source.id, parentRel)
+            ?: NetworkFolderIndexCache.loadWebDav(source.id, configKey, parentRel)
+        val stale = ZipAsDirListing.isZipAsDirStale(parentEntries, zipName)
+        if (useCache && !stale) {
+            val cached = BrowseSession.getWebDavListing(source.id, relativeDir)
+                ?: NetworkFolderIndexCache.loadWebDav(source.id, configKey, relativeDir)
+            if (cached != null) {
+                // EOCD listings are complete; there is no slim scan of a virtual zip path.
+                BrowseSession.putWebDavListing(source.id, relativeDir, cached, sessionCurrent = true)
+                onCached?.invoke(cached)
+                return cached
+            }
+        } else if (!useCache) {
+            BrowseSession.invalidateWebDavListing(source.id, relativeDir)
+        }
+        if (stale) {
+            BrowseSession.invalidateWebDavListingsUnder(source.id, zipRel)
+            NetworkFolderIndexCache.removeWebDavUnder(source.id, zipRel)
+        }
+        val title = inner.substringAfterLast('/').ifEmpty {
+            zipName.ifEmpty { source.displayName }
+        }
+        val entries = withIOContext {
+            try {
+                WebDavArchiveByteSource(
+                    source,
+                    password,
+                    zipRel,
+                    pipeline = false,
+                    readahead = false,
+                ).use { src ->
+                    val cd = ZipCentralDirectory.open(src, ZipCdParse.Enter) ?: return@use emptyList()
+                    val clearedParent = if (stale && parentEntries != null) {
+                        ZipAsDirListing.clearZipAsDirStale(parentEntries, zipName)
+                    } else {
+                        null
+                    }
+                    persistZipVirtualFolderTree(
+                        source,
+                        configKey,
+                        zipRel,
+                        cd,
+                        parentEntries = clearedParent?.takeIf { it !== parentEntries },
+                    )
+                    if (clearedParent != null && clearedParent !== parentEntries) {
+                        BrowseSession.putWebDavListing(
+                            source.id,
+                            ZipAsDirListing.parentRelative(zipRel),
+                            clearedParent,
+                            sessionCurrent = true,
+                        )
+                    }
+                    BrowseSession.getWebDavListing(source.id, relativeDir)
+                        ?: ZipAsDirListing.listingAt(cd, inner, title)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+        onCached?.invoke(entries)
+        return entries
+    }
+
+    private suspend fun zipRootListings(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        children: List<RemoteChild>,
+        zipInteriors: MutableMap<String, List<BrowseEntryRemote>>?,
+    ): Map<String, ZipAsDirListing.ZipRootListing> {
+        if (!Settings.browseZipAsDir.value) return emptyMap()
+        val zips = children.filter { !it.isDirectory && isZipArchiveFileName(it.name) }
+        if (zips.isEmpty()) return emptyMap()
+        val out = ConcurrentHashMap<String, ZipAsDirListing.ZipRootListing>()
+        val interiors = ConcurrentHashMap<String, List<BrowseEntryRemote>>()
+        val t0 = System.nanoTime()
+        val gate = Semaphore(peekConcurrency())
+        coroutineScope {
+            zips.map { child ->
+                async {
+                    gate.withPermit {
+                        val zipRel = joinRelative(relativeDir, child.name)
+                        runCatching {
+                            WebDavArchiveByteSource(
+                                source,
+                                password,
+                                zipRel,
+                                pipeline = false,
+                                knownSize = child.size,
+                                readahead = false,
+                            ).use { src ->
+                                val cd = ZipCentralDirectory.open(src, ZipCdParse.Parent) ?: return@use
+                                out[child.name] = ZipAsDirListing.zipRootListingFromCd(cd)
+                                val added = ZipAsDirListing.parentListingInteriors(cd, child.name)
+                                interiors.putAll(added)
+                                for ((rel, entries) in added) {
+                                    BrowseSession.putWebDavListing(
+                                        source.id,
+                                        ZipAsDirListing.joinPrefix(relativeDir, rel),
+                                        entries,
+                                        sessionCurrent = true,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+        zipInteriors?.putAll(interiors)
+        logcat("FolderIndex") {
+            "WebDAV zip-as-dir EOCD source=${source.id} dir=$relativeDir " +
+                "zips=${zips.size} ok=${out.size} interiors=${interiors.size} " +
+                "ms=${(System.nanoTime() - t0) / 1_000_000}"
+        }
+        return out
+    }
+
+    private suspend fun persistZipVirtualFolderTree(
+        source: WebDavSourceEntity,
+        configKey: String,
+        zipRel: String,
+        cd: ZipCentralDirectory,
+        parentEntries: List<BrowseEntryRemote>? = null,
+    ) {
+        val zipName = zipRel.substringAfterLast('/')
+        persistZipVirtualInteriors(
+            source,
+            configKey,
+            ZipAsDirListing.parentRelative(zipRel),
+            ZipAsDirListing.virtualFolderTree(cd, zipName),
+            parentEntries = parentEntries,
+        )
+    }
+
+    private suspend fun persistZipVirtualInteriors(
+        source: WebDavSourceEntity,
+        configKey: String,
+        parentRelativeDir: String,
+        interiors: Map<String, List<BrowseEntryRemote>>,
+        parentEntries: List<BrowseEntryRemote>? = null,
+    ) {
+        if (interiors.isEmpty() && parentEntries == null) return
+        ZipAsDirListing.persistFolderIndexes(
+            parentRelativeDir = parentRelativeDir,
+            interiors = interiors,
+            saveAll = { folders ->
+                NetworkFolderIndexCache.saveWebDavAll(source.id, configKey, folders)
+            },
+            putRam = { dir, entries ->
+                BrowseSession.putWebDavListing(source.id, dir, entries, sessionCurrent = true)
+            },
+            parentEntries = parentEntries,
+        )
+    }
+
+    private suspend fun persistParentAndZipInteriors(
+        source: WebDavSourceEntity,
+        configKey: String,
+        relativeDir: String,
+        parentEntries: List<BrowseEntryRemote>,
+        interiors: Map<String, List<BrowseEntryRemote>>,
+    ): List<BrowseEntryRemote> {
+        if (interiors.isEmpty()) {
+            return NetworkFolderIndexCache.saveWebDav(source.id, configKey, relativeDir, parentEntries)
+        }
+        val stored = ZipAsDirListing.persistFolderIndexes(
+            parentRelativeDir = relativeDir,
+            interiors = interiors,
+            saveAll = { folders ->
+                NetworkFolderIndexCache.saveWebDavAll(source.id, configKey, folders)
+            },
+            putRam = { dir, entries ->
+                BrowseSession.putWebDavListing(source.id, dir, entries, sessionCurrent = true)
+            },
+            parentEntries = parentEntries,
+        )
+        return stored[relativeDir.replace('\\', '/').trim('/')] ?: parentEntries
+    }
+
+    /**
+     * Shape a listing for the current zip-as-dir toggle and land it in RAM.
+     *
+     * On: keep zip Directory/FolderGallery rows. [persist] writes the parent index
+     * (deep classify). Slim/cache hits only [BrowseSession.putWebDavListing] so
+     * session-current can allow folder thumbs.
+     *
+     * Off: demote zip rows to ArchiveGallery, persist that, and drop interior keys.
+     */
+    private suspend fun presentListingForZipAsDirToggle(
+        source: WebDavSourceEntity,
+        configKey: String,
+        relativeDir: String,
+        entries: List<BrowseEntryRemote>,
+        sessionCurrent: Boolean,
+        previousForZipNames: List<BrowseEntryRemote>? = null,
+        persist: Boolean = false,
+    ): List<BrowseEntryRemote> {
+        if (Settings.browseZipAsDir.value) {
+            val stored = if (persist) {
+                NetworkFolderIndexCache.saveWebDav(source.id, configKey, relativeDir, entries)
+            } else {
+                entries
+            }
+            BrowseSession.putWebDavListing(source.id, relativeDir, stored, sessionCurrent = sessionCurrent)
+            return stored
+        }
+        var zips = ZipAsDirListing.cachedDirectZipAsDirNames(previousForZipNames ?: entries)
+        if (zips.isEmpty()) {
+            zips = ZipAsDirListing.cachedDirectZipAsDirNames(
+                NetworkFolderIndexCache.loadWebDav(source.id, configKey, relativeDir).orEmpty(),
+            )
+        }
+        val presented = ZipAsDirListing.demoteZipFoldersToArchives(entries)
+        if (zips.isEmpty() && presented == entries && !persist) {
+            BrowseSession.putWebDavListing(source.id, relativeDir, entries, sessionCurrent = sessionCurrent)
+            return entries
+        }
+        val stored = NetworkFolderIndexCache.saveWebDav(
+            source.id,
+            configKey,
+            relativeDir,
+            presented,
+            zips,
+        )
+        BrowseSession.putWebDavListing(source.id, relativeDir, stored, sessionCurrent = sessionCurrent)
+        for (name in zips) {
+            BrowseSession.invalidateWebDavListingsUnder(source.id, joinRelative(relativeDir, name))
+        }
+        return stored
+    }
+
+    /**
+     * Folder-bar submit search. WebDAV has no SEARCH we rely on; walk PROPFIND
+     * ourselves and abort on coroutine cancel (in-flight HTTP is cancelled).
+     */
+    suspend fun searchDirectory(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+        query: String,
+        includeHidden: Boolean = false,
+        onHits: suspend (List<BrowseEntryRemote>) -> Unit = {},
+    ): List<BrowseEntryRemote> {
+        val q = query.trim()
+        if (q.isEmpty()) return emptyList()
+        if (Settings.browseZipAsDir.value) {
+            ZipAsDirListing.splitZipBrowsePath(relativeDir)?.let { (zipRel, inner) ->
+                return withIOContext {
+                    WebDavArchiveByteSource(source, password, zipRel, pipeline = false).use { src ->
+                        val cd = ZipCentralDirectory.open(src, ZipCdParse.Enter)
+                            ?: return@use emptyList()
+                        FolderSearch.searchZipCentralDirectory(
+                            cd,
+                            inner,
+                            q,
+                            includeHidden,
+                            onHits,
+                        )
+                    }
+                }
+            }
+        }
+        val zipAsDir = Settings.browseZipAsDir.value
+        return FolderSearch.deepSearch(
+            searchRoot = relativeDir,
+            query = q,
+            includeHidden = includeHidden,
+            zipAsDir = zipAsDir,
+            parallelism = peekConcurrency(),
+            listChildren = { dir ->
+                try {
+                    listChildrenForRelativeDir(source, password, dir)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    logcat { "WebDavGateway: search skip dir=$dir ${e.message}" }
+                    emptyList()
+                }
+            },
+            onHits = onHits,
+        )
+    }
+
+    /** One PROPFIND, reused when a parent peek already listed this relative path. */
+    private suspend fun listChildrenForRelativeDir(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+    ): List<RemoteChild> = BrowseSession.rememberWebDavRawChildren(source.id, relativeDir) {
+        WebDavClient.listChildren(source, password, relativeDir)
+    }
+
+    suspend fun listImageFileNames(
+        source: WebDavSourceEntity,
+        password: String,
+        relativeDir: String,
+    ): List<String> {
+        // Complete index → no PROPFIND. Miss → live list like before (stateless HTTP).
+        FolderGalleryIndex.loadWebDav(source.id, sourceConfigKey(source), relativeDir)?.let { return it }
+        if (Settings.browseZipAsDir.value) {
+            ZipAsDirListing.splitZipBrowsePath(relativeDir)?.let { (zipRel, inner) ->
+                return withIOContext {
+                    runCatching {
+                        WebDavArchiveByteSource(source, password, zipRel, pipeline = false).use { src ->
+                            val cd = ZipCentralDirectory.open(src) ?: return@use emptyList()
+                            ZipAsDirListing.directImageNames(cd, inner)
+                        }
+                    }.getOrDefault(emptyList())
+                }
+            }
+        }
+        return WebDavClient.listImageFileNames(source, password, relativeDir)
+    }
+}

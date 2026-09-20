@@ -1,0 +1,56 @@
+package com.ehviewer.core.database.dao
+
+import androidx.paging.PagingSource
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Upsert
+import com.ehviewer.core.database.model.GalleryEntity
+import com.ehviewer.core.database.model.HistoryInfo
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface HistoryDao {
+    @Query("SELECT HISTORY.* FROM HISTORY JOIN GALLERIES USING(GID) ORDER BY TIME")
+    suspend fun list(): List<HistoryInfo>
+
+    /** History rows (gid + time) for recency sorts (e.g. Library list). */
+    @Query("SELECT * FROM HISTORY")
+    fun listFlow(): Flow<List<HistoryInfo>>
+
+    @Query("SELECT GALLERIES.* FROM HISTORY JOIN GALLERIES USING(GID) ORDER BY TIME DESC")
+    fun joinListLazy(): PagingSource<Int, GalleryEntity>
+
+    /** Full history for live in-UI filtering (Library/History search box). */
+    @Query("SELECT GALLERIES.* FROM HISTORY JOIN GALLERIES USING(GID) ORDER BY TIME DESC")
+    fun joinListFlow(): Flow<List<GalleryEntity>>
+
+    @Query(
+        """SELECT GALLERIES.* FROM HISTORY JOIN GALLERIES USING(GID)
+        JOIN GALLERIES_FTS ON GALLERIES.rowid = docid WHERE GALLERIES_FTS MATCH :title ORDER BY TIME DESC""",
+    )
+    fun joinListLazy(title: String): PagingSource<Int, GalleryEntity>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertOrIgnore(historyInfoList: List<HistoryInfo>)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertOrIgnore(historyInfo: HistoryInfo)
+
+    /**
+     * Bump recency for an existing history row.
+     * @return number of rows updated (0 = no history row for [gid]).
+     */
+    @Query("UPDATE HISTORY SET TIME = :time WHERE GID = :gid")
+    suspend fun bumpTime(gid: Long, time: Long): Int
+
+    @Upsert
+    suspend fun upsert(historyInfo: HistoryInfo)
+
+    @Query("DELETE FROM HISTORY WHERE GID = :gid")
+    suspend fun deleteByKey(gid: Long)
+
+    @Query("DELETE FROM HISTORY")
+    suspend fun deleteAll()
+}

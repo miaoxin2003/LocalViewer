@@ -1,0 +1,2260 @@
+package com.hippo.ehviewer.ui.screen
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.AnimatedVisibilityScope
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridScope
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.LibraryBooks
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.CircularWavyProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.ehviewer.core.database.model.WebDavSourceEntity
+import com.ehviewer.core.i18n.R
+import com.ehviewer.core.model.BaseGalleryInfo
+import com.ehviewer.core.model.GalleryInfo.Companion.NOT_FAVORITED
+import com.ehviewer.core.ui.component.FastScrollLazyVerticalGrid
+import com.ehviewer.core.ui.util.thenIf
+import com.ehviewer.core.util.launch
+import com.ehviewer.core.util.launchIO
+import com.ehviewer.core.util.withIOContext
+import com.ehviewer.core.util.withUIContext
+import com.hippo.ehviewer.Settings
+import com.hippo.ehviewer.collectAsState
+import com.hippo.ehviewer.library.ARCHIVE_DOWNLOAD_WARN_BYTES
+import com.hippo.ehviewer.library.ArchiveCoverCache
+import com.hippo.ehviewer.library.ArchiveTooLargeException
+import com.hippo.ehviewer.library.BrowseContentMode
+import com.hippo.ehviewer.library.BrowseEntryRemote
+import com.hippo.ehviewer.library.BrowseFavorites
+import com.hippo.ehviewer.library.BrowseFolderId
+import com.hippo.ehviewer.library.BrowseSession
+import com.hippo.ehviewer.library.BrowseVirtualKind
+import com.hippo.ehviewer.library.EmptyArchiveRegistry
+import com.hippo.ehviewer.library.FolderGalleryIndex
+import com.hippo.ehviewer.library.FolderSearch
+import com.hippo.ehviewer.library.HistoryThumbKey
+import com.hippo.ehviewer.library.LocalHistory
+import com.hippo.ehviewer.library.NetworkFolderIndexCache
+import com.hippo.ehviewer.library.ReaderGalleryPlaylist
+import com.hippo.ehviewer.library.RemoteArchiveOpen
+import com.hippo.ehviewer.library.VideoThumbnail
+import com.hippo.ehviewer.library.VideoThumbnailSource
+import com.hippo.ehviewer.library.WEBDAV_ARCHIVE_TOKEN
+import com.hippo.ehviewer.library.WEBDAV_FOLDER_TOKEN
+import com.hippo.ehviewer.library.ZipAsDirListing
+import com.hippo.ehviewer.library.browseScrollLayoutKey
+import com.hippo.ehviewer.library.filterRemoteByContentMode
+import com.hippo.ehviewer.library.filterRemoteSmallGalleries
+import com.hippo.ehviewer.library.isDocumentFileName
+import com.hippo.ehviewer.library.isHtmlFileName
+import com.hippo.ehviewer.library.isImageFileName
+import com.hippo.ehviewer.library.isPdfFileName
+import com.hippo.ehviewer.library.isSolidArchiveFileName
+import com.hippo.ehviewer.library.isStreamableArchiveFileName
+import com.hippo.ehviewer.library.isZipArchiveFileName
+import com.hippo.ehviewer.library.isZipMemberTooLarge
+import com.hippo.ehviewer.library.isZipPlainFolderListing
+import com.hippo.ehviewer.library.joinRemoteArchivePath
+import com.hippo.ehviewer.library.mimeTypeForFileName
+import com.hippo.ehviewer.library.naturalCompare
+import com.hippo.ehviewer.library.stableGalleryId
+import com.hippo.ehviewer.library.toRemoteBrowseSections
+import com.hippo.ehviewer.ui.DrawerHandle
+import com.hippo.ehviewer.ui.LocalShowNavShortcutFab
+import com.hippo.ehviewer.ui.OpenFileExternally
+import com.hippo.ehviewer.ui.OpenPdfExternally
+import com.hippo.ehviewer.ui.Screen
+import com.hippo.ehviewer.ui.destinations.BrowseScreenDestination
+import com.hippo.ehviewer.ui.destinations.HistoryScreenDestination
+import com.hippo.ehviewer.ui.destinations.LibraryScreenDestination
+import com.hippo.ehviewer.ui.destinations.ReaderScreenDestination
+import com.hippo.ehviewer.ui.main.BrowseArchiveGalleryRow
+import com.hippo.ehviewer.ui.main.BrowseArchiveGridItem
+import com.hippo.ehviewer.ui.main.BrowseCover
+import com.hippo.ehviewer.ui.main.BrowseDirectoryGridItem
+import com.hippo.ehviewer.ui.main.BrowseDirectoryRow
+import com.hippo.ehviewer.ui.main.BrowseEmptyHint
+import com.hippo.ehviewer.ui.main.BrowseFileGridItem
+import com.hippo.ehviewer.ui.main.BrowseFileRow
+import com.hippo.ehviewer.ui.main.BrowseFolderGalleryGridItem
+import com.hippo.ehviewer.ui.main.BrowseFolderGalleryRow
+import com.hippo.ehviewer.ui.main.BrowseFolderSection
+import com.hippo.ehviewer.ui.main.BrowseOverflowActions
+import com.hippo.ehviewer.ui.main.BrowseOverflowKind
+import com.hippo.ehviewer.ui.main.BrowsePhotoGridImageItem
+import com.hippo.ehviewer.ui.main.BrowseSaveAs
+import com.hippo.ehviewer.ui.main.BrowseSearchSectionHeader
+import com.hippo.ehviewer.ui.main.BrowseSectionHeader
+import com.hippo.ehviewer.ui.main.BrowseVideoGridItem
+import com.hippo.ehviewer.ui.main.BrowseVideoRow
+import com.hippo.ehviewer.ui.main.GalleryGridDefaults
+import com.hippo.ehviewer.ui.main.HttpShare
+import com.hippo.ehviewer.ui.main.HttpShareItem
+import com.hippo.ehviewer.ui.main.awaitHttpShareQr
+import com.hippo.ehviewer.ui.main.browseZipAsDirTypeLabel
+import com.hippo.ehviewer.ui.main.rememberBrowseSectionCollapse
+import com.hippo.ehviewer.ui.navToReader
+import com.hippo.ehviewer.ui.navToWebDavFolderReader
+import com.hippo.ehviewer.ui.reader.ReaderScreenArgs
+import com.hippo.ehviewer.ui.tools.awaitConfirmationOrCancel
+import com.hippo.ehviewer.util.LocalNetworkPermission
+import com.hippo.ehviewer.util.addTextToClipboard
+import com.hippo.ehviewer.util.ensureLocalNetworkPermission
+import com.hippo.ehviewer.webdav.WebDavGateway
+import com.hippo.ehviewer.webdav.WebDavPasswordStore
+import com.hippo.ehviewer.webdav.WebDavRepository
+import com.ramcosta.composedestinations.annotation.Destination
+import com.ramcosta.composedestinations.annotation.RootGraph
+import com.ramcosta.composedestinations.navigation.DestinationsNavigator
+import kotlinx.coroutines.CancellationException
+import moe.tarsin.snackbar
+import moe.tarsin.string
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Destination<RootGraph>
+@Composable
+fun AnimatedVisibilityScope.WebDavBrowserScreen(
+    sourceId: Long,
+    initialRelativePath: String = "",
+    fromHistory: Boolean = false,
+    fromLibrary: Boolean = false,
+    navigator: DestinationsNavigator,
+) = Screen(navigator) {
+    DrawerHandle(false)
+    val context = LocalContext.current
+    var source by remember { mutableStateOf<WebDavSourceEntity?>(null) }
+
+    // Session-scoped path. Empty list = share root and is *not* "unset":
+    // do not fall back to initialRelativePath when session is empty, or returning from
+    // the reader after climbing to root re-opens the History deep folder.
+    var segments by remember {
+        val stored = BrowseSession.webDavSegmentsOrNull(sourceId)
+        val initial = stored ?: initialRelativePath.split('/').filter { it.isNotEmpty() }.also {
+            BrowseSession.setWebDavSegments(sourceId, it)
+        }
+        mutableStateOf(initial)
+    }
+
+    /**
+     * How many path segments each [enterDir] appended. Promoted video leaves append
+     * `S/leaf` (2); goUp pops that many so one back action returns to the listing
+     * that showed the `@` row. Deep-links leave this empty → goUp drops 1.
+     */
+    var enterHopStack by remember { mutableStateOf(emptyList<Int>()) }
+
+    /**
+     * Listing that owned the Search section when a dir was opened from that section.
+     * Next goUp jumps here in one hop (does not walk Album → …). Overflow Open folder
+     * leaves this null. Independent of [BrowseSession.webDavExitToOrigin].
+     */
+    var searchReturnRel by remember { mutableStateOf<String?>(null) }
+
+    fun updateSegments(new: List<String>) {
+        segments = new
+        BrowseSession.setWebDavSegments(sourceId, new)
+        if (new.isEmpty()) enterHopStack = emptyList()
+    }
+
+    var entries by remember { mutableStateOf<List<BrowseEntryRemote>>(emptyList()) }
+
+    /** Relative dir the current [entries] belong to. */
+    var listedDir by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var refreshing by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    val listMode by Settings.listMode.collectAsState()
+    var photoGridOverlay by remember {
+        mutableStateOf(BrowseSession.webDavPhotoGrid(sourceId))
+    }
+    fun setPhotoGrid(
+        dir: String?,
+        enteredFromParent: Boolean = false,
+        exitToOrigin: Boolean = false,
+    ) {
+        photoGridOverlay = if (dir == null) {
+            null
+        } else {
+            BrowseSession.PhotoGridOverlay(dir, enteredFromParent, exitToOrigin)
+        }
+        BrowseSession.setWebDavPhotoGrid(sourceId, dir, enteredFromParent, exitToOrigin)
+    }
+    val photoGridDir = photoGridOverlay?.dir
+    val showGalleryPages by Settings.showGalleryPages.collectAsState()
+    val browseFolderThumbs by Settings.browseFolderThumbs.collectAsState()
+    val browseZipAsDir by Settings.browseZipAsDir.collectAsState()
+    val photoGridMode by Settings.photoGridMode.collectAsState()
+    val relativeDirForMode = segments.joinToString("/")
+    val zipPlainFolder = isZipPlainFolderListing(
+        relativeDirForMode,
+        hasFolderGallery = entries.any { it is BrowseEntryRemote.FolderGallery },
+        listingReady = listedDir == relativeDirForMode && entries.isNotEmpty(),
+    )
+    val virtual = when {
+        photoGridDir == relativeDirForMode -> BrowseVirtualKind.PhotoGrid
+        zipPlainFolder -> BrowseVirtualKind.ZipPlainFolder
+        else -> BrowseVirtualKind.None
+    }
+    val photoGrid = virtual == BrowseVirtualKind.PhotoGrid
+    val photoGridNow = rememberUpdatedState(photoGrid)
+    val folderId = BrowseFolderId.webDav(sourceId, relativeDirForMode)
+    val contentMode = rememberEffectiveBrowseContentMode(folderId)
+    val useGrid = virtual.forceGrid || listMode == 1
+    val scrollLayoutKey = browseScrollLayoutKey(listMode, contentMode, virtual)
+    val favoriteKeys by Settings.favoriteBrowseSources.collectAsState()
+    val addedToFavourites = stringResource(id = R.string.add_to_favourites)
+    val removedFromFavourites = stringResource(id = R.string.remove_from_favourites)
+    // Scroll down hides the top bar; scroll up brings it back (enterAlways).
+    val scrollBehavior = TopAppBarDefaults.enterAlwaysScrollBehavior()
+    // FAB tracks the same enterAlways state (hide when bar collapses, show when it reappears).
+    val showScrollFab by remember {
+        derivedStateOf { scrollBehavior.state.collapsedFraction < 0.5f }
+    }
+
+    val relativeDir = relativeDirForMode
+    val title = segments.lastOrNull() ?: source?.displayName ?: stringResource(R.string.network)
+
+    fun dirRelative(name: String): String = if (relativeDir.isEmpty()) name else WebDavGateway.joinRelative(relativeDir, name)
+
+    fun toggleDirFavorite(name: String, coverFileName: String? = null) {
+        val rel = dirRelative(name)
+        val coverKey = coverFileName?.let { fileName ->
+            val coverRemote = if (rel.isEmpty()) {
+                fileName
+            } else {
+                WebDavGateway.joinRelative(rel, fileName)
+            }
+            HistoryThumbKey.webdav(sourceId, coverRemote)
+        }
+        BrowseFavorites.toggleWebDavFolder(sourceId, rel, thumbKey = coverKey)
+    }
+
+    fun isDirFavorite(name: String): Boolean = BrowseFavorites.webDavFolderKey(sourceId, dirRelative(name)) in favoriteKeys
+
+    val emptyArchiveRev by EmptyArchiveRegistry.revision.collectAsState()
+    val displayEntries = remember(entries, emptyArchiveRev, relativeDir, sourceId) {
+        EmptyArchiveRegistry.filterRemoteEntries(entries) { arch ->
+            "webdav:$sourceId:${joinRemoteArchivePath(relativeDir, arch.parentRelativeName, arch.fileName)}"
+        }
+    }
+    val search = rememberBrowseFolderSearchState()
+    val searchFolderKey = BrowseSession.webDavFolderSearchKey(sourceId, relativeDir)
+    var searchHits by remember(searchFolderKey) {
+        mutableStateOf(BrowseSession.peekFolderSearchHits<BrowseEntryRemote>(searchFolderKey))
+    }
+    var searching by remember { mutableStateOf(false) }
+    val focusManager = LocalFocusManager.current
+    // Restore before filteredEntries / list so Search-section items exist when scroll applies.
+    BindBrowseFolderSearch(
+        folderKey = searchFolderKey,
+        search = search,
+        onPathChange = { scrollBehavior.state.heightOffset = 0f },
+    )
+    val showSmallGalleries by Settings.browseShowSmallGalleries.collectAsState()
+    val smallGalleryMinPages by Settings.browseSmallGalleryMinPages.collectAsState()
+    val showHiddenFiles by Settings.browseShowHiddenFiles.collectAsState()
+    val showVirtualGalleries by Settings.browseShowVirtualGalleries.collectAsState()
+    val filteredEntries = remember(
+        displayEntries,
+        search.keyword,
+        contentMode,
+        showSmallGalleries,
+        smallGalleryMinPages,
+        showHiddenFiles,
+        showVirtualGalleries,
+        virtual,
+    ) {
+        val liveSearch = search.keyword.trim().isNotEmpty()
+        val base = when (virtual) {
+            BrowseVirtualKind.PhotoGrid ->
+                displayEntries
+                    .filterIsInstance<BrowseEntryRemote.RegularFile>()
+                    .filter { isImageFileName(it.fileName.substringAfterLast('/')) }
+                    .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+            BrowseVirtualKind.ZipPlainFolder ->
+                displayEntries
+                    .filterRemoteByContentMode(
+                        BrowseContentMode.Folder,
+                        showHiddenFiles,
+                        showVirtualGalleries,
+                        allTypes = liveSearch,
+                    )
+                    .filterRemoteSmallGalleries(showSmallGalleries, smallGalleryMinPages)
+            BrowseVirtualKind.VideoFolder ->
+                displayEntries
+                    .filterRemoteByContentMode(
+                        BrowseContentMode.Video,
+                        showHiddenFiles,
+                        showVirtualGalleries,
+                        allTypes = liveSearch,
+                    )
+                    .filterRemoteSmallGalleries(showSmallGalleries, smallGalleryMinPages)
+            BrowseVirtualKind.RpcShareRoot,
+            BrowseVirtualKind.None,
+            ->
+                displayEntries
+                    .filterRemoteByContentMode(
+                        contentMode,
+                        showHiddenFiles,
+                        showVirtualGalleries,
+                        allTypes = liveSearch,
+                    )
+                    .filterRemoteSmallGalleries(showSmallGalleries, smallGalleryMinPages)
+        }
+        base.filterByBrowseSearch(search.keyword) { it.name }
+    }
+
+    /**
+     * Image RegularFiles in the current listing — photo-grid virtual folder **and**
+     * Folder-mode loose images (shared reader / cover keys).
+     */
+    val folderImages = remember(filteredEntries) {
+        filteredEntries
+            .filterIsInstance<BrowseEntryRemote.RegularFile>()
+            .filter { isImageFileName(it.fileName.substringAfterLast('/')) }
+            .sortedWith { a, b -> naturalCompare(a.name, b.name) }
+    }
+    val searchHint = stringResource(R.string.search_bar_hint, title)
+
+    LaunchedEffect(
+        searchFolderKey,
+        search.submittedKeyword,
+        search.submitGeneration,
+        showHiddenFiles,
+    ) {
+        val q = search.submittedKeyword
+        if (q.isEmpty()) {
+            searchHits = emptyList()
+            searching = false
+            BrowseSession.clearFolderSearchHits(searchFolderKey)
+            return@LaunchedEffect
+        }
+        val cached = BrowseSession.cachedFolderSearchHits<BrowseEntryRemote>(
+            searchFolderKey,
+            q,
+            search.submitGeneration,
+            showHiddenFiles,
+        )
+        if (cached != null) {
+            searchHits = cached
+            searching = false
+            return@LaunchedEffect
+        }
+        searching = true
+        searchHits = emptyList()
+        try {
+            val src = source ?: withIOContext { WebDavRepository.load(sourceId) }?.also { source = it }
+                ?: return@LaunchedEffect
+            val password = withIOContext { WebDavPasswordStore.get(src.id) }
+            if (!ensureLocalNetworkPermission()) return@LaunchedEffect
+            searchHits = WebDavGateway.searchDirectory(
+                src,
+                password,
+                relativeDir,
+                q,
+                includeHidden = showHiddenFiles,
+            ) { searchHits = it }
+            BrowseSession.putFolderSearchHits(
+                searchFolderKey,
+                BrowseSession.FolderSearchHits(
+                    submittedKeyword = q,
+                    submitGeneration = search.submitGeneration,
+                    includeHidden = showHiddenFiles,
+                    hits = searchHits,
+                ),
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Throwable) {
+            BrowseSession.putFolderSearchHits(
+                searchFolderKey,
+                BrowseSession.FolderSearchHits(
+                    submittedKeyword = q,
+                    submitGeneration = search.submitGeneration,
+                    includeHidden = showHiddenFiles,
+                    hits = searchHits,
+                ),
+            )
+        } finally {
+            searching = false
+        }
+    }
+
+    /** Detect share/pathPrefix/host edits while this screen stays on the back stack. */
+    var lastConfigKey by remember { mutableStateOf<String?>(null) }
+
+    /**
+     * Bumped for pull-to-refresh / toolbar refresh / ON_RESUME soft refresh.
+     * Path changes are driven solely by [relativeDir] in [LaunchedEffect] — no parallel
+     * `launch { reload() }` that can race and leave [loading] stuck true.
+     */
+    var refreshToken by remember { mutableStateOf(0) }
+    var forceNextLoad by remember { mutableStateOf(false) }
+
+    /**
+     * True after a successful full/slim list of the currently shown directory in this process.
+     * Disk-hydrated (old) listings stay false so UI withholds network thumbs.
+     */
+    var listingSessionCurrent by remember { mutableStateOf(false) }
+
+    /**
+     * Paint session-cache listing immediately when changing path (go up / enter).
+     * History → deep folder often has parent listings cached from the original browse;
+     * applying them here avoids empty+spinner while the path-keyed effect starts.
+     */
+    fun applyCachedListing(dir: String): Boolean {
+        val cached = BrowseSession.getWebDavCachedListing(sourceId, dir) ?: return false
+        entries = ZipAsDirListing.presentCachedListing(cached.entries)
+        listingSessionCurrent = cached.sessionCurrent
+        listedDir = dir
+        loading = false
+        error = null
+        return true
+    }
+
+    /** RAM miss → disk index hydrate so go-up / relaunch paints before network. */
+    suspend fun hydrateDiskListing(dir: String): Boolean {
+        if (BrowseSession.getWebDavCachedListing(sourceId, dir) != null) {
+            return applyCachedListing(dir)
+        }
+        val src = source ?: withIOContext { WebDavRepository.load(sourceId) }?.also { source = it }
+            ?: return false
+        val disk = NetworkFolderIndexCache.loadWebDav(
+            sourceId,
+            WebDavGateway.sourceConfigKey(src),
+            dir,
+        ) ?: return false
+        val presented = ZipAsDirListing.presentCachedListing(disk)
+        BrowseSession.putWebDavListing(sourceId, dir, presented, sessionCurrent = false)
+        entries = presented
+        listingSessionCurrent = false
+        listedDir = dir
+        loading = false
+        error = null
+        return true
+    }
+
+    fun requestForceReload() {
+        forceNextLoad = true
+        refreshToken++
+    }
+
+    var prevZipAsDir by remember { mutableStateOf(browseZipAsDir) }
+    LaunchedEffect(browseZipAsDir) {
+        if (browseZipAsDir != prevZipAsDir) {
+            prevZipAsDir = browseZipAsDir
+            if (!browseZipAsDir) {
+                ZipAsDirListing.parentSegmentsOfZipBrowsePath(relativeDir)?.let { parent ->
+                    updateSegments(parent)
+                }
+            }
+            requestForceReload()
+        }
+    }
+
+    // Turning Hidden files on: mark listing non-current so slim quick-scan deep-scans
+    // shallow-tagged `.nomedia` / dot directories (parity with FolderBrowserScreen).
+    var prevShowHidden by remember { mutableStateOf(showHiddenFiles) }
+    LaunchedEffect(showHiddenFiles, sourceId, relativeDir) {
+        if (showHiddenFiles && !prevShowHidden) {
+            BrowseSession.getWebDavCachedListing(sourceId, relativeDir)?.let { cached ->
+                BrowseSession.putWebDavListing(
+                    sourceId,
+                    relativeDir,
+                    cached.entries,
+                    sessionCurrent = false,
+                )
+            }
+            refreshToken++
+        }
+        prevShowHidden = showHiddenFiles
+    }
+
+    // Single loader for the current path. When [relativeDir] changes, Compose cancels this
+    // effect and starts a new one — that is the only concurrency control we need.
+    // Previous epoch/ON_RESUME races could ++epoch, early-return without clearing loading,
+    // and leave History→up→up stuck on an empty infinite spinner (manual refresh worked).
+    LaunchedEffect(sourceId, relativeDir, refreshToken) {
+        VideoThumbnail.onBrowseFolderChanged("dav:$sourceId:$relativeDir")
+        ArchiveCoverCache.onBrowseFolderChanged("dav:$sourceId:$relativeDir")
+        val targetDir = relativeDir
+        val force = forceNextLoad
+        forceNextLoad = false
+
+        val src = withIOContext { WebDavRepository.load(sourceId) }?.also { source = it } ?: run {
+            error = "Source missing"
+            entries = emptyList()
+            listedDir = targetDir
+            loading = false
+            return@LaunchedEffect
+        }
+        val configKey = WebDavGateway.sourceConfigKey(src)
+        val configChanged = lastConfigKey != null && lastConfigKey != configKey
+        lastConfigKey = configKey
+        if (configChanged) {
+            // Path/share changed: drop stack (session already cleared by disconnect).
+            if (segments.isNotEmpty()) {
+                updateSegments(emptyList())
+            }
+            entries = emptyList()
+            listedDir = null
+            // relativeDir will change → this effect is cancelled and restarted at root.
+            if (targetDir.isNotEmpty()) {
+                loading = false
+                refreshing = false
+                return@LaunchedEffect
+            }
+        }
+
+        val loadDir = if (configChanged) "" else targetDir
+        // Photo-grid open: same complete index the reader uses — no directory scan.
+        if (!force && !configChanged && photoGridNow.value) {
+            val names = FolderGalleryIndex.loadWebDav(src.id, configKey, loadDir)
+            if (!names.isNullOrEmpty()) {
+                if (listedDir != loadDir || entries.isEmpty()) {
+                    entries = FolderGalleryIndex.photoGridRemoteFiles(names)
+                    listedDir = loadDir
+                    listingSessionCurrent = true
+                }
+                loading = false
+                refreshing = false
+                error = null
+                return@LaunchedEffect
+            }
+        }
+        val haveListing = listedDir == loadDir && entries.isNotEmpty()
+        // Soft resume (same path, already shown): no full-screen spinner.
+        val needSpinner = force || configChanged || !haveListing
+        if (needSpinner) {
+            loading = true
+            if (listedDir != loadDir) {
+                // Prefer instant RAM/disk paint before network (especially go-up from History).
+                when {
+                    !force && !configChanged && applyCachedListing(loadDir) -> loading = false
+                    !force && !configChanged && hydrateDiskListing(loadDir) -> loading = false
+                    else -> entries = emptyList()
+                }
+            }
+        }
+        error = null
+
+        // Password decrypt uses Android Keystore — keep it off Main (StrictMode).
+        val password = withIOContext { WebDavPasswordStore.get(src.id) }
+        if (!ensureLocalNetworkPermission()) {
+            val denied = LocalNetworkPermission.deniedMessage(context)
+            if (entries.isEmpty()) {
+                error = denied
+                listedDir = loadDir
+                listingSessionCurrent = false
+                WebDavRepository.markError(src.id, denied)
+            }
+            loading = false
+            refreshing = false
+            return@LaunchedEffect
+        }
+        // On cancel (path change / new refreshToken), do NOT clear loading — goUp/enterDir or
+        // the replacement effect already owns that flag. Clearing here caused empty+spinner
+        // races and could leave a superseded load stuck spinning forever.
+        try {
+            // Process-scoped list job inside gateway; effect cancel only drops this await.
+            val result = WebDavGateway.listDirectory(
+                src,
+                password,
+                loadDir,
+                useCache = !force && !configChanged,
+                onCached = { cached ->
+                    entries = cached
+                    listedDir = loadDir
+                    listingSessionCurrent =
+                        BrowseSession.isWebDavListingSessionCurrent(sourceId, loadDir)
+                    error = null
+                    loading = false
+                    refreshing = true
+                },
+                onRefreshDone = {
+                    if (listedDir == loadDir) refreshing = false
+                },
+            )
+            // Still the active effect for this path (not cancelled) → safe to commit.
+            entries = result
+            listedDir = loadDir
+            listingSessionCurrent =
+                BrowseSession.isWebDavListingSessionCurrent(sourceId, loadDir)
+            WebDavRepository.markOk(src.id)
+            error = null
+            loading = false
+            refreshing = WebDavGateway.isListing(sourceId, loadDir)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Path changed or refreshToken bumped — new effect owns loading state.
+            throw e
+        } catch (e: Throwable) {
+            if (entries.isEmpty()) {
+                error = e.message
+                listedDir = loadDir
+                listingSessionCurrent = false
+                WebDavRepository.markError(src.id, e.message ?: "error")
+            } else {
+                error = null
+                listingSessionCurrent =
+                    BrowseSession.isWebDavListingSessionCurrent(sourceId, loadDir)
+            }
+            loading = false
+            refreshing = false
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            VideoThumbnail.onBrowseFolderLeft("dav:")
+            ArchiveCoverCache.onBrowseFolderLeft("dav:")
+        }
+    }
+
+    // Resume after Manage-sources edit or app background: soft refresh current path only.
+    // Must not call a free-floating reload that races path changes (see LaunchedEffect above).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, sourceId) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                // Soft: keep rows if listed; token bump re-runs effect for current relativeDir.
+                refreshToken++
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    /**
+     * Enter a directory by real relative path under the current listing.
+     * [relativeName] may be multi-segment for promoted video leaves (`S/leaf`) —
+     * never use display names like `@S-leaf` as path segments.
+     */
+    fun enterDir(relativeName: String, fromSearch: Boolean = false) {
+        val parts = relativeName.split('/').filter { it.isNotEmpty() }
+        if (parts.isEmpty()) return
+        setPhotoGrid(null)
+        if (fromSearch) {
+            if (searchReturnRel == null) searchReturnRel = relativeDir
+        } else {
+            searchReturnRel = null
+            // Deeper navigation owns the stack; do not jump back to History/Library on goUp.
+            BrowseSession.setWebDavExitToOrigin(sourceId, false)
+        }
+        val next = segments + parts
+        val nextDir = next.joinToString("/")
+        enterHopStack = enterHopStack + parts.size
+        updateSegments(next)
+        if (!applyCachedListing(nextDir)) {
+            // Show spinner for uncached child; effect will load.
+            entries = emptyList()
+            listedDir = null
+            loading = true
+        }
+    }
+
+    /** Overflow "Open folder". No-op when the target is already this listing. */
+    fun openBrowseFolder(targetRel: String) {
+        if (targetRel.isEmpty()) return
+        searchReturnRel = null
+        search.close()
+        BrowseSession.putFolderSearch(searchFolderKey, search.snapshot())
+        enterDir(targetRel)
+    }
+
+    /** Same jump as the Back-to Browse/History/Library FAB. */
+    fun jumpBackToOrigin() {
+        when {
+            fromHistory -> {
+                if (!navigator.popBackStack(HistoryScreenDestination, inclusive = false)) {
+                    navigator.navigate(HistoryScreenDestination) { launchSingleTop = true }
+                }
+            }
+            fromLibrary -> {
+                if (!navigator.popBackStack(LibraryScreenDestination, inclusive = false)) {
+                    navigator.navigate(LibraryScreenDestination) { launchSingleTop = true }
+                }
+            }
+            else -> {
+                if (!navigator.popBackStack(BrowseScreenDestination, inclusive = false)) {
+                    navigator.navigate(BrowseScreenDestination) { launchSingleTop = true }
+                }
+            }
+        }
+    }
+
+    fun goUp() {
+        // Exit photo-grid: parent listing, leave browser (alwaysExitToDir off from
+        // History/Library), or clear virtual layer only.
+        if (photoGrid) {
+            val leaveChild = photoGridOverlay?.enteredFromParent == true
+            val exitToOrigin = photoGridOverlay?.exitToOrigin == true
+            setPhotoGrid(null)
+            when {
+                leaveChild -> Unit // Fall through to pop the gallery directory.
+                exitToOrigin -> {
+                    navigator.popBackStack()
+                    return
+                }
+                else -> return
+            }
+        }
+        // Dir pin from History/Library/Fav with alwaysExitToDir off: leave immediately.
+        if (BrowseSession.webDavExitToOrigin(sourceId) && searchReturnRel == null) {
+            BrowseSession.setWebDavExitToOrigin(sourceId, false)
+            jumpBackToOrigin()
+            return
+        }
+        val searchOrigin = searchReturnRel
+        if (searchOrigin != null) {
+            searchReturnRel = null
+            val target = FolderSearch.searchReturnDir(searchOrigin, relativeDir)
+            if (target != null) {
+                val originSegs = target.split('/').filter { it.isNotEmpty() }
+                enterHopStack = emptyList()
+                updateSegments(originSegs)
+                if (!applyCachedListing(target)) {
+                    entries = emptyList()
+                    listedDir = null
+                    loading = true
+                }
+                return
+            }
+        }
+        if (segments.isNotEmpty()) {
+            val hop = (enterHopStack.lastOrNull() ?: 1).coerceIn(1, segments.size)
+            enterHopStack = if (enterHopStack.isNotEmpty()) enterHopStack.dropLast(1) else enterHopStack
+            val next = segments.dropLast(hop)
+            val nextDir = next.joinToString("/")
+            updateSegments(next)
+            // History deep-link parents are often already in session cache — paint now so
+            // the second/third go-up never flashes empty+infinite refresh while effect starts.
+            if (!applyCachedListing(nextDir)) {
+                entries = emptyList()
+                listedDir = null
+                loading = true
+            }
+        } else {
+            navigator.popBackStack()
+        }
+    }
+
+    val hideBackToFab by Settings.hideBackToFab.collectAsState()
+    fun onTopBarBack() {
+        if (hideBackToFab) jumpBackToOrigin() else goUp()
+    }
+
+    BackHandler(enabled = searchReturnRel != null || search.active || segments.isNotEmpty() || photoGrid) {
+        // Search-section dir enter: first back returns to search, not close-search-in-child.
+        if (searchReturnRel == null && search.handleBack { focusManager.clearFocus() }) {
+            return@BackHandler
+        }
+        goUp()
+    }
+
+    /** History path link for the folder currently listed (parent of the opened file). */
+    suspend fun recordCurrentBrowseFolderHistory(sourceId: Long) {
+        val folderThumb = LocalHistory.webDavBrowseFolderThumbKey(
+            sourceId = sourceId,
+            relativeDir = relativeDir,
+            entries = entries,
+        )
+        LocalHistory.recordWebDavBrowseFolder(
+            sourceId = sourceId,
+            relativePath = relativeDir,
+            title = title,
+            thumbKey = folderThumb,
+        )
+    }
+
+    fun openFolderGallery(entry: BrowseEntryRemote.FolderGallery) {
+        val src = source ?: return
+        ReaderGalleryPlaylist.setFromWebDavBrowse(src.id, relativeDir, entries)
+        val remote = if (entry.relativeName.isEmpty()) {
+            relativeDir
+        } else {
+            WebDavGateway.joinRelative(relativeDir, entry.relativeName)
+        }
+        // Same remote cover path as browse [coverFor] → HistoryThumbKey → webdav_thumb_cache.
+        val coverKey = LocalHistory.zipOrRemoteThumbKey(
+            sourceId = src.id,
+            listedDir = relativeDir,
+            relativeName = entry.relativeName,
+            coverFileName = entry.coverFileName,
+            smb = false,
+        )
+        val gid = stableGalleryId(src.id, "webdav:$remote")
+        val info = BaseGalleryInfo(
+            gid = gid,
+            // Keep History identity on the reader info so progress FK inserts cannot
+            // orphan network galleries (token=local + empty uploader).
+            token = WEBDAV_FOLDER_TOKEN,
+            title = entry.name,
+            pages = if (entry.pageCountCapped) 0 else entry.pageCount,
+            favoriteSlot = NOT_FAVORITED,
+            rating = -1f,
+            thumbKey = coverKey,
+            uploader = "${src.id}\u0000${remote.trim('/')}",
+            category = 3,
+        )
+        launchIO {
+            // Parent browse dir (not gated by file/gallery prefs) + gallery row.
+            recordCurrentBrowseFolderHistory(src.id)
+            // History = folder gallery (open → reader). Same gid as progress.
+            LocalHistory.recordWebDavFolderGallery(
+                sourceId = src.id,
+                remoteDir = remote,
+                title = entry.name,
+                thumbKey = coverKey,
+                pages = if (entry.pageCountCapped) 0 else entry.pageCount,
+                info = info,
+            )
+        }
+        // When capped or partial, pass empty names so reader re-lists full set
+        val names = if (entry.pageCountCapped) emptyList() else entry.imageFileNames
+        navToWebDavFolderReader(src.id, remote, names, info)
+    }
+
+    fun openFolderGalleryPhotoGrid(entry: BrowseEntryRemote.FolderGallery) {
+        val remote = if (entry.relativeName.isEmpty()) {
+            relativeDir
+        } else {
+            WebDavGateway.joinRelative(relativeDir, entry.relativeName)
+        }
+        val entered = entry.relativeName.isNotEmpty()
+        val names = FolderGalleryIndex.completeNames(entry)
+        val parentCurrent = listingSessionCurrent
+        if (entered) {
+            enterDir(entry.relativeName)
+        }
+        setPhotoGrid(remote, enteredFromParent = entered)
+        // Child gallery: paint the reader file list now so enterDir does not scan.
+        // Current-dir overlay keeps the existing listing (leave photo-grid stays here).
+        if (entered && names != null) {
+            entries = FolderGalleryIndex.photoGridRemoteFiles(names)
+            listedDir = remote
+            listingSessionCurrent = parentCurrent
+            loading = false
+            refreshing = false
+            error = null
+        }
+    }
+
+    fun openFolderGalleryPrimary(entry: BrowseEntryRemote.FolderGallery) {
+        if (photoGridMode) openFolderGalleryPhotoGrid(entry) else openFolderGallery(entry)
+    }
+
+    fun openFolderGallerySecondary(entry: BrowseEntryRemote.FolderGallery) {
+        if (photoGridMode) openFolderGallery(entry) else openFolderGalleryPhotoGrid(entry)
+    }
+
+    fun openNestedFolderImage(parentRel: String, fileName: String) {
+        val src = source ?: return
+        val remote = if (relativeDir.isEmpty()) {
+            parentRel
+        } else {
+            WebDavGateway.joinRelative(relativeDir, parentRel)
+        }
+        launchIO {
+            val password = WebDavPasswordStore.get(src.id)
+            val names = runCatching {
+                WebDavGateway.listImageFileNames(src, password, remote)
+            }.getOrDefault(emptyList())
+            if (names.isEmpty()) return@launchIO
+            val page = names.indexOfFirst { it.equals(fileName, ignoreCase = true) }.coerceAtLeast(0)
+            val coverKey = names.firstOrNull()?.let { coverName ->
+                LocalHistory.zipOrRemoteThumbKey(
+                    sourceId = src.id,
+                    listedDir = remote,
+                    relativeName = "",
+                    coverFileName = coverName,
+                    smb = false,
+                )
+            }
+            val galleryTitle = FolderSearch.baseName(parentRel).ifEmpty { title }
+            val gid = stableGalleryId(src.id, "webdav:$remote")
+            val info = BaseGalleryInfo(
+                gid = gid,
+                token = WEBDAV_FOLDER_TOKEN,
+                title = galleryTitle,
+                pages = names.size,
+                favoriteSlot = NOT_FAVORITED,
+                rating = -1f,
+                thumbKey = coverKey,
+                uploader = "${src.id}\u0000${remote.trim('/')}",
+                category = 3,
+            )
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFolderGallery(
+                sourceId = src.id,
+                remoteDir = remote,
+                title = galleryTitle,
+                thumbKey = coverKey,
+                pages = names.size,
+                info = info,
+            )
+            withUIContext {
+                navToWebDavFolderReader(src.id, remote, names, info, page)
+            }
+        }
+    }
+
+    /**
+     * Tap an image (photo-grid virtual folder **or** Folder-mode file row) → reader at that page.
+     * Same page list / [HistoryThumbKey] cover path as the photo-grid path.
+     */
+    fun openFolderImage(file: BrowseEntryRemote.RegularFile) {
+        val src = source ?: return
+        val rel = file.fileName.replace('\\', '/').trim('/')
+        val fileName = FolderSearch.baseName(rel)
+        if (!isImageFileName(fileName)) return
+        val parentRel = FolderSearch.parentRelative(rel)
+        val inListing = parentRel.isEmpty() &&
+            folderImages.any { it.fileName == file.fileName }
+        if (!inListing) {
+            openNestedFolderImage(parentRel, fileName)
+            return
+        }
+        val images = folderImages
+        val page = images.indexOfFirst { it.fileName == file.fileName }.coerceAtLeast(0)
+        val names = images.map { it.fileName }
+        val coverKey = names.firstOrNull()?.let { coverName ->
+            LocalHistory.zipOrRemoteThumbKey(
+                sourceId = src.id,
+                listedDir = relativeDir,
+                relativeName = "",
+                coverFileName = coverName,
+                smb = false,
+            )
+        }
+        val gid = stableGalleryId(src.id, "webdav:$relativeDir")
+        val info = BaseGalleryInfo(
+            gid = gid,
+            token = WEBDAV_FOLDER_TOKEN,
+            title = title,
+            pages = names.size,
+            favoriteSlot = NOT_FAVORITED,
+            rating = -1f,
+            thumbKey = coverKey,
+            uploader = "${src.id}\u0000${relativeDir.trim('/')}",
+            category = 3,
+        )
+        launchIO {
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFolderGallery(
+                sourceId = src.id,
+                remoteDir = relativeDir,
+                title = title,
+                thumbKey = coverKey,
+                pages = names.size,
+                info = info,
+            )
+        }
+        ReaderGalleryPlaylist.setFromWebDavBrowse(src.id, relativeDir, entries)
+        navToWebDavFolderReader(src.id, relativeDir, names, info, page)
+    }
+
+    fun imageCoverFor(file: BrowseEntryRemote.RegularFile): BrowseCover {
+        ZipAsDirListing.zipAsDirCoverParts(relativeDir, "", file.fileName)?.let { (zipRel, member) ->
+            return BrowseCover.WebDavZipMember(sourceId, zipRel, member)
+        }
+        val remote = if (relativeDir.isEmpty()) {
+            file.fileName
+        } else {
+            WebDavGateway.joinRelative(relativeDir, file.fileName)
+        }
+        return BrowseCover.WebDav(sourceId, remote)
+    }
+
+    fun openPdfInOtherApp(entry: BrowseEntryRemote.ArchiveGallery) {
+        if (!isPdfFileName(entry.fileName)) return
+        val src = source ?: return
+        val remote = joinRemoteArchivePath(relativeDir, entry.parentRelativeName, entry.fileName)
+        launchIO {
+            // Parent dir + file row (non-dir open).
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFile(src.id, remote, title = entry.name)
+            try {
+                OpenPdfExternally.openWebDav(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = entry.name,
+                )
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(
+                        R.string.open_pdf_external_failed,
+                        e.message ?: e.toString(),
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Long-press archive → system "Open with". Tap still opens in-app reader.
+     * PDF uses [openPdfInOtherApp].
+     */
+    fun openArchiveInOtherApp(entry: BrowseEntryRemote.ArchiveGallery) {
+        if (isPdfFileName(entry.fileName)) {
+            openPdfInOtherApp(entry)
+            return
+        }
+        val src = source ?: return
+        val remote = joinRemoteArchivePath(relativeDir, entry.parentRelativeName, entry.fileName)
+        launchIO {
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFile(src.id, remote, title = entry.name)
+            try {
+                OpenFileExternally.openWebDav(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = entry.name,
+                    mimeType = mimeTypeForFileName(entry.name),
+                )
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) +
+                        " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    fun openExternalFile(fileName: String, asFile: Boolean = false, usePreferredPlayer: Boolean = true) {
+        val src = source ?: return
+        // fileName may be multi-segment for promoted single-video rows (`S/leaf/movie.mp4`).
+        // Launch with the real basename so MIME and player title stay correct.
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            // Parent dir + file/video row (non-dir open).
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFile(src.id, remote, title = actualName)
+            try {
+                OpenFileExternally.openWebDav(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = actualName,
+                    mimeType = mimeTypeForFileName(actualName),
+                    asFile = asFile,
+                    usePreferredPlayer = usePreferredPlayer,
+                )
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) + " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    fun openWebDavHtml(fileName: String, incognito: Boolean) {
+        val src = source ?: return
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFile(src.id, remote, title = actualName)
+            try {
+                OpenFileExternally.openWebDavHtml(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = actualName,
+                    mimeType = mimeTypeForFileName(actualName),
+                    incognito = incognito,
+                )
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) + " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    fun copyWebDavHtmlUrl(fileName: String) {
+        val src = source ?: return
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            try {
+                val uri = OpenFileExternally.ensureWebDavHtmlHttpUri(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = actualName,
+                    mimeType = mimeTypeForFileName(actualName),
+                )
+                withUIContext {
+                    with(context) { addTextToClipboard(uri.toString()) }
+                }
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) + " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    /** In-app Media3 player. */
+    fun playVideo(fileName: String) {
+        val src = source ?: return
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            recordCurrentBrowseFolderHistory(src.id)
+            LocalHistory.recordWebDavFile(src.id, remote, title = actualName)
+            try {
+                OpenFileExternally.playWebDav(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = actualName,
+                    mimeType = mimeTypeForFileName(actualName),
+                    playlistRemoteFiles = entries
+                        .filterIsInstance<BrowseEntryRemote.VideoFile>()
+                        .map { WebDavGateway.joinRelative(relativeDir, it.fileName) },
+                )
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) + " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    /** Primary action: Media3 when [Settings.useMedia3Player] is on, else external. */
+    fun openVideoPrimary(fileName: String) {
+        if (Settings.useMedia3Player.value) playVideo(fileName) else openExternalFile(fileName)
+    }
+
+    /** Long-press: opposite of [openVideoPrimary]. */
+    fun openVideoSecondary(fileName: String) {
+        if (Settings.useMedia3Player.value) openExternalFile(fileName) else playVideo(fileName)
+    }
+
+    fun openArchive(entry: BrowseEntryRemote.ArchiveGallery) {
+        val src = source ?: return
+        if (browseZipAsDir && isZipArchiveFileName(entry.fileName)) {
+            enterDir(entry.fileName)
+            return
+        }
+        // fileName is only the basename from the current listing — join with the folder we are in.
+        val remote = joinRemoteArchivePath(relativeDir, entry.parentRelativeName, entry.fileName)
+        launchIO {
+            try {
+                // Parent browse dir (not gated by file/gallery prefs) + file row.
+                recordCurrentBrowseFolderHistory(src.id)
+                ReaderGalleryPlaylist.setFromWebDavBrowse(src.id, relativeDir, entries)
+                if (isStreamableArchiveFileName(entry.fileName) ||
+                    isSolidArchiveFileName(entry.fileName) ||
+                    isDocumentFileName(entry.fileName)
+                ) {
+                    val remoteNorm = remote.trim('/')
+                    val coverKey = HistoryThumbKey.webdavArchive(src.id, remoteNorm)
+                    val info = BaseGalleryInfo(
+                        gid = stableGalleryId(src.id, "dava:$remoteNorm"),
+                        token = WEBDAV_ARCHIVE_TOKEN,
+                        title = entry.name,
+                        pages = 0,
+                        favoriteSlot = NOT_FAVORITED,
+                        rating = -1f,
+                        thumbKey = coverKey,
+                        uploader = "${src.id}\u0000$remoteNorm",
+                        category = 1,
+                    )
+                    LocalHistory.ensureGalleryForProgress(info)
+                    LocalHistory.recordWebDavStreamArchive(src.id, remoteNorm, title = entry.name, info = info)
+                    withUIContext {
+                        navigator.navigate(
+                            ReaderScreenDestination(
+                                ReaderScreenArgs.WebDavStreamArchive(
+                                    sourceId = src.id,
+                                    remotePath = remoteNorm,
+                                    info = info,
+                                ),
+                            ),
+                        ) { launchSingleTop = true }
+                    }
+                    return@launchIO
+                }
+                val password = WebDavPasswordStore.get(src.id)
+                var allowLarge = false
+                while (true) {
+                    try {
+                        val result = RemoteArchiveOpen.ensureWebDavArchive(
+                            source = src,
+                            password = password,
+                            remoteRelativeFile = remote,
+                            allowLarge = allowLarge,
+                            onWillDownload = {
+                                snackbar(string(R.string.archive_downloading))
+                            },
+                        )
+                        LocalHistory.recordLocalArchive(
+                            result.path.toString(),
+                            title = entry.name,
+                        )
+                        withUIContext {
+                            navToReader(result.path.toString())
+                        }
+                        return@launchIO
+                    } catch (e: ArchiveTooLargeException) {
+                        val miB = (e.sizeBytes / (1024 * 1024)).toInt()
+                        val limit = (ARCHIVE_DOWNLOAD_WARN_BYTES / (1024 * 1024)).toInt()
+                        awaitConfirmationOrCancel(title = R.string.archive_large_title) {
+                            Text(string(R.string.archive_large_message, miB, limit))
+                        }
+                        allowLarge = true
+                    }
+                }
+            } catch (_: CancellationException) {
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(string(R.string.archive_download_failed, e.message ?: e.toString()))
+            }
+        }
+    }
+
+    fun notSupportedAction() {
+        launch { snackbar(context.getString(R.string.browse_action_not_supported)) }
+    }
+
+    fun copyWebDavVideoUrl(fileName: String) {
+        val src = source ?: return
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            try {
+                val uri = OpenFileExternally.ensureWebDavVideoHttpUri(
+                    context = context,
+                    sourceId = src.id,
+                    remoteRelativeFile = remote,
+                    displayName = actualName,
+                    mimeType = mimeTypeForFileName(actualName),
+                )
+                withUIContext {
+                    with(context) { addTextToClipboard(uri.toString()) }
+                }
+            } catch (e: Throwable) {
+                if (e.isZipMemberTooLarge()) return@launchIO
+                snackbar(
+                    context.getString(R.string.browse_open_failed) + " " + (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    fun saveWebDavFile(fileName: String, displayName: String = fileName.substringAfterLast('/')) {
+        val src = source ?: return
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            with(context) { BrowseSaveAs.saveWebDavFile(src.id, remote, displayName) }
+        }
+    }
+
+    fun shareWebDavFile(fileName: String, displayName: String = fileName.substringAfterLast('/')) {
+        val src = source ?: return
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        launchIO {
+            with(context) { BrowseSaveAs.shareWebDavFile(src.id, remote, displayName) }
+        }
+    }
+
+    fun saveWebDavFolder(relativeName: String, displayName: String = relativeName.substringAfterLast('/')) {
+        val src = source ?: return
+        val remote = if (relativeDir.isEmpty()) relativeName else WebDavGateway.joinRelative(relativeDir, relativeName)
+        val name = displayName.ifEmpty { relativeName.substringAfterLast('/') }
+        launchIO {
+            with(context) { BrowseSaveAs.saveWebDavFolder(src.id, remote, name) }
+        }
+    }
+
+    fun shareWebDavViaHttp(block: suspend () -> HttpShareItem) {
+        launchIO {
+            try {
+                val item = block()
+                withUIContext { awaitHttpShareQr(item) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                snackbar(
+                    context.getString(R.string.browse_http_share_failed) + " " +
+                        (e.message ?: e.toString()),
+                )
+            }
+        }
+    }
+
+    fun webDavHttpShareFile(fileName: String): (() -> Unit)? {
+        val src = source ?: return null
+        if (!HttpShare.canShareRemote(relativeDir, fileName, folderLike = false)) return null
+        val actualName = fileName.substringAfterLast('/').substringAfterLast('\\')
+        val remote = if (relativeDir.isEmpty()) fileName else WebDavGateway.joinRelative(relativeDir, fileName)
+        return {
+            shareWebDavViaHttp {
+                HttpShare.startWebDavFile(
+                    context,
+                    src.id,
+                    remote,
+                    actualName,
+                    mimeTypeForFileName(actualName),
+                )
+            }
+        }
+    }
+
+    fun webDavHttpShareFolder(relativeName: String, displayName: String = relativeName.substringAfterLast('/')): (() -> Unit)? {
+        val src = source ?: return null
+        if (!HttpShare.canShareRemote(relativeDir, relativeName, folderLike = true)) return null
+        val remote = if (relativeDir.isEmpty()) relativeName else WebDavGateway.joinRelative(relativeDir, relativeName)
+        val name = displayName.ifEmpty { relativeName.substringAfterLast('/') }
+        return {
+            shareWebDavViaHttp { HttpShare.startWebDavFolder(context, src.id, remote, name) }
+        }
+    }
+
+    fun dirOverflow(name: String, coverFileName: String? = null) = BrowseOverflowActions(
+        kind = BrowseOverflowKind.Common,
+        favorited = isDirFavorite(name),
+        onFavorite = { toggleDirFavorite(name, coverFileName) },
+        onSaveAs = { saveWebDavFolder(name) },
+        onShareViaHttp = webDavHttpShareFolder(name),
+        onOpenFolder = { openBrowseFolder(FolderSearch.openFolderTarget(name, isDirectory = true)) },
+        onUnsupported = { notSupportedAction() },
+    )
+
+    fun folderGalleryOverflow(entry: BrowseEntryRemote.FolderGallery) = BrowseOverflowActions(
+        kind = BrowseOverflowKind.Gallery,
+        favorited = isDirFavorite(entry.relativeName),
+        onFavorite = { toggleDirFavorite(entry.relativeName, entry.coverFileName) },
+        onRead = { openFolderGallery(entry) },
+        onPhotoGrid = { openFolderGalleryPhotoGrid(entry) },
+        onSaveAs = { saveWebDavFolder(entry.relativeName, entry.name) },
+        onShareViaHttp = webDavHttpShareFolder(entry.relativeName, entry.name),
+        onOpenFolder = {
+            openBrowseFolder(FolderSearch.openFolderTarget(entry.relativeName, isDirectory = true))
+        },
+        onUnsupported = { notSupportedAction() },
+    )
+
+    fun archiveOverflow(entry: BrowseEntryRemote.ArchiveGallery) = BrowseOverflowActions(
+        kind = BrowseOverflowKind.Gallery,
+        onRead = { openArchive(entry) },
+        onOpenWith = { openArchiveInOtherApp(entry) },
+        onSaveAs = {
+            saveWebDavFile(
+                joinRemoteArchivePath("", entry.parentRelativeName, entry.fileName),
+                entry.fileName.substringAfterLast('/'),
+            )
+        },
+        onShare = {
+            shareWebDavFile(
+                joinRemoteArchivePath("", entry.parentRelativeName, entry.fileName),
+                entry.fileName.substringAfterLast('/'),
+            )
+        },
+        onShareViaHttp = webDavHttpShareFile(
+            joinRemoteArchivePath("", entry.parentRelativeName, entry.fileName),
+        ),
+        onOpenFolder = {
+            openBrowseFolder(
+                FolderSearch.openFolderTarget(
+                    joinRemoteArchivePath("", entry.parentRelativeName, entry.fileName),
+                    isDirectory = false,
+                ),
+            )
+        },
+        onUnsupported = { notSupportedAction() },
+    )
+
+    fun videoOverflow(fileName: String) = BrowseOverflowActions(
+        kind = BrowseOverflowKind.Video,
+        onPlay = { playVideo(fileName) },
+        onExternalPlayer = { openExternalFile(fileName) },
+        onCopyUrl = { copyWebDavVideoUrl(fileName) },
+        onOpenWith = { openExternalFile(fileName, usePreferredPlayer = false) },
+        onSaveAs = { saveWebDavFile(fileName) },
+        onShare = { shareWebDavFile(fileName) },
+        onShareViaHttp = webDavHttpShareFile(fileName),
+        onOpenFolder = {
+            openBrowseFolder(FolderSearch.openFolderTarget(fileName, isDirectory = false))
+        },
+        onUnsupported = { notSupportedAction() },
+    )
+
+    fun fileOverflow(fileName: String) = if (isHtmlFileName(fileName)) {
+        BrowseOverflowActions(
+            kind = BrowseOverflowKind.Webpage,
+            onOpenInBrowser = { openWebDavHtml(fileName, incognito = false) },
+            onOpenIncognito = { openWebDavHtml(fileName, incognito = true) },
+            onCopyUrl = { copyWebDavHtmlUrl(fileName) },
+            onOpenWith = { openExternalFile(fileName, asFile = true) },
+            onSaveAs = { saveWebDavFile(fileName) },
+            onShare = { shareWebDavFile(fileName) },
+            onShareViaHttp = webDavHttpShareFile(fileName),
+            onOpenFolder = {
+                openBrowseFolder(FolderSearch.openFolderTarget(fileName, isDirectory = false))
+            },
+            onUnsupported = { notSupportedAction() },
+        )
+    } else {
+        BrowseOverflowActions(
+            kind = BrowseOverflowKind.Common,
+            onOpenWith = { openExternalFile(fileName) },
+            onSaveAs = { saveWebDavFile(fileName) },
+            onShare = { shareWebDavFile(fileName) },
+            onShareViaHttp = webDavHttpShareFile(fileName),
+            onOpenFolder = {
+                openBrowseFolder(FolderSearch.openFolderTarget(fileName, isDirectory = false))
+            },
+            onUnsupported = { notSupportedAction() },
+        )
+    }
+
+    Scaffold(
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        topBar = {
+            TopAppBar(
+                title = {
+                    if (search.active) {
+                        BrowseTopBarSearchField(state = search, hint = searchHint)
+                    } else {
+                        Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                },
+                windowInsets = WindowInsets.safeDrawing.only(WindowInsetsSides.Top),
+                colors = adaptiveTopAppBarColors(),
+                navigationIcon = {
+                    IconButton(onClick = { onTopBarBack() }, shapes = IconButtonDefaults.shapes()) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
+                    }
+                },
+                actions = {
+                    BrowseTopBarSearchAction(
+                        state = search,
+                        onBeforeClose = { focusManager.clearFocus() },
+                    )
+                    BrowseViewModeMenu(
+                        folder = if (virtual.isVirtual) null else folderId,
+                        hideContentModes = virtual.hideContentModes,
+                    )
+                    IconButton(
+                        onClick = {
+                            refreshing = true
+                            requestForceReload()
+                        },
+                        shapes = IconButtonDefaults.shapes(),
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = null)
+                    }
+                },
+                scrollBehavior = scrollBehavior,
+            )
+        },
+        floatingActionButton = {
+            // Compact phones without persistent main nav: shortcut FAB.
+            // Settings → Hide Back-to FAB: hide and map top-bar back to the same jump.
+            // Visibility follows enterAlways top-bar scroll (same collapsedFraction).
+            if (LocalShowNavShortcutFab.current && !hideBackToFab) {
+                AnimatedVisibility(
+                    visible = showScrollFab,
+                    enter = fadeIn() + scaleIn(),
+                    exit = fadeOut() + scaleOut(),
+                ) {
+                    when {
+                        fromHistory -> ExtendedFloatingActionButton(
+                            onClick = { jumpBackToOrigin() },
+                            icon = {
+                                Icon(Icons.Default.History, contentDescription = null)
+                            },
+                            text = { Text(stringResource(R.string.back_to_history)) },
+                        )
+                        fromLibrary -> ExtendedFloatingActionButton(
+                            onClick = { jumpBackToOrigin() },
+                            icon = {
+                                Icon(Icons.AutoMirrored.Filled.LibraryBooks, contentDescription = null)
+                            },
+                            text = { Text(stringResource(R.string.back_to_library)) },
+                        )
+                        else -> ExtendedFloatingActionButton(
+                            onClick = { jumpBackToOrigin() },
+                            icon = {
+                                Icon(Icons.Default.Explore, contentDescription = null)
+                            },
+                            text = { Text(stringResource(R.string.back_to_browse)) },
+                        )
+                    }
+                }
+            }
+        },
+    ) { padding ->
+        PullToRefreshBox(
+            isRefreshing = refreshing || loading,
+            onRefresh = {
+                refreshing = true
+                requestForceReload()
+            },
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .browseSearchClearFocusOnInteract(search),
+        ) {
+            when {
+                loading && (entries.isEmpty() || listedDir != relativeDir) -> {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularWavyProgressIndicator()
+                    }
+                }
+                error != null && displayEntries.isEmpty() -> {
+                    BrowseEmptyHint(string(R.string.webdav_listing_error, error!!))
+                }
+                displayEntries.isEmpty() && searchHits.isEmpty() && !searching -> {
+                    BrowseEmptyHint(stringResource(R.string.folder_empty))
+                }
+                filteredEntries.isEmpty() && searchHits.isEmpty() && !searching &&
+                    search.submittedKeyword.isEmpty() -> {
+                    BrowseEmptyHint(stringResource(R.string.folder_empty))
+                }
+                else -> {
+                    val dirKey = listedDir ?: relativeDir
+                    val allowRemoteThumbs = listingSessionCurrent
+                    val favoritesOnTop by Settings.browseFavoritesOnTop.collectAsState()
+                    val browseSortModePref by Settings.browseSortMode.collectAsState()
+                    val browseSortMode = BrowseSortMode.fromPref(browseSortModePref)
+                    val browseSortAscending by Settings.browseSortAscending.collectAsState()
+                    val sections = filteredEntries.toRemoteBrowseSections()
+                    // UI-only order; listing / folderImages / open-gallery stay name-sorted.
+                    val dirsRaw = sections.directories
+                        .filterIsInstance<BrowseEntryRemote.Directory>()
+                        .sortedForBrowseFolderUi(
+                            browseSortMode,
+                            browseSortAscending,
+                            nameOf = { it.name },
+                            dateOf = { it.lastModifiedMs },
+                        )
+                    val dirs = if (favoritesOnTop) {
+                        val (fav, rest) = dirsRaw.partition { isDirFavorite(it.relativeName) }
+                        fav + rest
+                    } else {
+                        dirsRaw
+                    }
+                    val galleries = sections.galleries.sortedForBrowseFolderUi(
+                        browseSortMode,
+                        browseSortAscending,
+                        nameOf = { it.name },
+                        dateOf = { it.lastModifiedMs },
+                    )
+                    val videos = sections.videos
+                        .filterIsInstance<BrowseEntryRemote.VideoFile>()
+                        .sortedForBrowseFolderUi(
+                            browseSortMode,
+                            browseSortAscending,
+                            nameOf = { it.name },
+                            dateOf = { it.lastModifiedMs },
+                        )
+                    val files = sections.files
+                        .filterIsInstance<BrowseEntryRemote.RegularFile>()
+                        .sortedForBrowseFolderUi(
+                            browseSortMode,
+                            browseSortAscending,
+                            nameOf = { it.name },
+                            dateOf = { it.lastModifiedMs },
+                        )
+                    // In-memory only; resets when dirKey changes. No prefs / no ripple on header.
+                    val animateItems by Settings.animateItems.collectAsState()
+                    val (collapsedSections, toggleSection) = rememberBrowseSectionCollapse(
+                        BrowseSession.webDavListingKey(sourceId, dirKey),
+                    )
+
+                    // Keys must stay unique when dual-list + "this folder as gallery" share a name
+                    // (e.g. parent/ff has images and a child dir also named ff → g-self vs g-child-ff).
+                    fun galleryKey(it: BrowseEntryRemote): String = when (it) {
+                        is BrowseEntryRemote.FolderGallery ->
+                            if (it.relativeName.isEmpty()) {
+                                "g-self"
+                            } else {
+                                "g-child-${it.relativeName}"
+                            }
+                        is BrowseEntryRemote.ArchiveGallery ->
+                            "a-${it.parentRelativeName}/${it.fileName}"
+                        else -> "x-${it.name}"
+                    }
+                    fun zipMemberCover(relativeName: String, coverFileName: String?): BrowseCover? {
+                        if (!browseZipAsDir) return null
+                        val parts = ZipAsDirListing.zipAsDirCoverParts(
+                            relativeDir,
+                            relativeName,
+                            coverFileName,
+                        ) ?: return null
+                        return BrowseCover.WebDavZipMember(sourceId, parts.first, parts.second)
+                    }
+                    fun coverFor(entry: BrowseEntryRemote.FolderGallery): BrowseCover? {
+                        zipMemberCover(entry.relativeName, entry.coverFileName)?.let { return it }
+                        val fileName = entry.coverFileName ?: return null
+                        val remote = if (entry.relativeName.isEmpty()) {
+                            WebDavGateway.joinRelative(relativeDir, fileName)
+                        } else {
+                            WebDavGateway.joinRelative(
+                                WebDavGateway.joinRelative(relativeDir, entry.relativeName),
+                                fileName,
+                            )
+                        }
+                        return BrowseCover.WebDav(sourceId, remote)
+                    }
+                    fun dirCoverFor(dir: BrowseEntryRemote.Directory): BrowseCover? {
+                        zipMemberCover(dir.relativeName, dir.coverFileName)?.let { return it }
+                        val fileName = dir.coverFileName ?: return null
+                        val remote = WebDavGateway.joinRelative(
+                            WebDavGateway.joinRelative(relativeDir, dir.relativeName),
+                            fileName,
+                        )
+                        return BrowseCover.WebDav(sourceId, remote)
+                    }
+                    fun archiveCoverFor(entry: BrowseEntryRemote.ArchiveGallery): BrowseCover? {
+                        // ZIP/TAR/EPUB stream + solid RAR/7z + documents.
+                        if (!isStreamableArchiveFileName(entry.fileName) &&
+                            !isSolidArchiveFileName(entry.fileName) &&
+                            !isDocumentFileName(entry.fileName)
+                        ) {
+                            return null
+                        }
+                        // Same path identity as openArchive / reader cacheKey.
+                        val remote = joinRemoteArchivePath(
+                            relativeDir,
+                            entry.parentRelativeName,
+                            entry.fileName,
+                        )
+                        return BrowseCover.WebDavArchive(sourceId, remote)
+                    }
+                    fun searchHitKey(entry: BrowseEntryRemote): String = when (entry) {
+                        is BrowseEntryRemote.Directory -> "d-${entry.relativeName}"
+                        is BrowseEntryRemote.FolderGallery -> "g-${entry.relativeName}"
+                        is BrowseEntryRemote.ArchiveGallery ->
+                            "a-${entry.parentRelativeName}/${entry.fileName}"
+                        is BrowseEntryRemote.VideoFile -> "v-${entry.fileName}"
+                        is BrowseEntryRemote.RegularFile -> "f-${entry.fileName}"
+                    }
+                    fun LazyGridScope.searchSection(grid: Boolean) {
+                        if (search.submittedKeyword.isEmpty() && !searching) return
+                        item(key = "hdr-search", span = { GridItemSpan(maxLineSpan) }) {
+                            BrowseSearchSectionHeader(
+                                searching = searching,
+                                onClick = { toggleSection(BrowseFolderSection.Search) },
+                            )
+                        }
+                        if (BrowseFolderSection.Search in collapsedSections) return
+                        if (searchHits.isEmpty()) {
+                            item(key = "search-status", span = { GridItemSpan(maxLineSpan) }) {
+                                if (searching) {
+                                    Box(
+                                        Modifier.fillMaxWidth().padding(24.dp),
+                                        contentAlignment = Alignment.Center,
+                                    ) {
+                                        CircularWavyProgressIndicator()
+                                    }
+                                } else {
+                                    BrowseEmptyHint(stringResource(R.string.browse_search_empty))
+                                }
+                            }
+                            return
+                        }
+                        items(searchHits, key = { "s-${searchHitKey(it)}" }) { entry ->
+                            val itemMod = Modifier.thenIf(animateItems) { animateItem() }
+                            when (entry) {
+                                is BrowseEntryRemote.Directory -> if (grid) {
+                                    BrowseDirectoryGridItem(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        onClick = { enterDir(entry.relativeName, fromSearch = true) },
+                                        onLongClick = {
+                                            toggleDirFavorite(entry.relativeName, entry.coverFileName)
+                                        },
+                                        showFavoriteStar = isDirFavorite(entry.relativeName),
+                                        cover = dirCoverFor(entry),
+                                        showFolderThumb = browseFolderThumbs,
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        overflow = dirOverflow(entry.relativeName, entry.coverFileName),
+                                    )
+                                } else {
+                                    BrowseDirectoryRow(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        onClick = { enterDir(entry.relativeName, fromSearch = true) },
+                                        onLongClick = {
+                                            toggleDirFavorite(entry.relativeName, entry.coverFileName)
+                                        },
+                                        cover = dirCoverFor(entry),
+                                        showFolderThumb = browseFolderThumbs,
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        lastModifiedMs = entry.lastModifiedMs,
+                                        sizeBytes = entry.size,
+                                        typeLabel = browseZipAsDirTypeLabel(
+                                            entry.relativeName,
+                                            entry.name,
+                                        ) ?: "Dir",
+                                        overflow = dirOverflow(entry.relativeName, entry.coverFileName),
+                                        showFavoriteStar = isDirFavorite(entry.relativeName),
+                                    )
+                                }
+                                is BrowseEntryRemote.FolderGallery -> if (grid) {
+                                    BrowseFolderGalleryGridItem(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        pageCount = entry.pageCount,
+                                        pageCountCapped = entry.pageCountCapped,
+                                        cover = coverFor(entry),
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        showPages = showGalleryPages,
+                                        onClick = { openFolderGalleryPrimary(entry) },
+                                        onLongClick = { openFolderGallerySecondary(entry) },
+                                        overflow = folderGalleryOverflow(entry),
+                                    )
+                                } else {
+                                    BrowseFolderGalleryRow(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        pageCount = entry.pageCount,
+                                        pageCountCapped = entry.pageCountCapped,
+                                        cover = coverFor(entry),
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        showPages = showGalleryPages,
+                                        onClick = { openFolderGalleryPrimary(entry) },
+                                        onLongClick = { openFolderGallerySecondary(entry) },
+                                        lastModifiedMs = entry.lastModifiedMs,
+                                        sizeBytes = entry.size,
+                                        typeLabel = browseZipAsDirTypeLabel(
+                                            entry.relativeName,
+                                            entry.name,
+                                        ) ?: "Folder",
+                                        overflow = folderGalleryOverflow(entry),
+                                    )
+                                }
+                                is BrowseEntryRemote.ArchiveGallery -> if (grid) {
+                                    BrowseArchiveGridItem(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        cover = archiveCoverFor(entry),
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        onClick = { openArchive(entry) },
+                                        onLongClick = { openArchiveInOtherApp(entry) },
+                                        overflow = archiveOverflow(entry),
+                                    )
+                                } else {
+                                    BrowseArchiveGalleryRow(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        cover = archiveCoverFor(entry),
+                                        thumbRetryKey = refreshToken,
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        onClick = { openArchive(entry) },
+                                        onLongClick = { openArchiveInOtherApp(entry) },
+                                        fileName = entry.fileName,
+                                        sizeBytes = entry.size,
+                                        lastModifiedMs = entry.lastModifiedMs,
+                                        pageCount = entry.pageCount,
+                                        showPages = showGalleryPages,
+                                        overflow = archiveOverflow(entry),
+                                    )
+                                }
+                                is BrowseEntryRemote.VideoFile -> if (grid) {
+                                    BrowseVideoGridItem(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        thumbnailSource = VideoThumbnailSource.WebDav(
+                                            sourceId = sourceId,
+                                            remoteRelativeFile = joinRemoteArchivePath(
+                                                relativeDir,
+                                                "",
+                                                entry.fileName,
+                                            ),
+                                            knownSizeBytes = entry.size,
+                                        ),
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        onClick = { openVideoPrimary(entry.fileName) },
+                                        onLongClick = { openVideoSecondary(entry.fileName) },
+                                        overflow = videoOverflow(entry.fileName),
+                                    )
+                                } else {
+                                    BrowseVideoRow(
+                                        modifier = itemMod,
+                                        name = entry.name,
+                                        thumbnailSource = VideoThumbnailSource.WebDav(
+                                            sourceId = sourceId,
+                                            remoteRelativeFile = joinRemoteArchivePath(
+                                                relativeDir,
+                                                "",
+                                                entry.fileName,
+                                            ),
+                                            knownSizeBytes = entry.size,
+                                        ),
+                                        allowRemoteFetch = allowRemoteThumbs,
+                                        onClick = { openVideoPrimary(entry.fileName) },
+                                        onLongClick = { openVideoSecondary(entry.fileName) },
+                                        fileName = entry.fileName,
+                                        sizeBytes = entry.size,
+                                        lastModifiedMs = entry.lastModifiedMs,
+                                        overflow = videoOverflow(entry.fileName),
+                                    )
+                                }
+                                is BrowseEntryRemote.RegularFile -> {
+                                    val isImage = isImageFileName(
+                                        entry.fileName.substringAfterLast('/'),
+                                    )
+                                    if (grid) {
+                                        if (isImage) {
+                                            BrowsePhotoGridImageItem(
+                                                modifier = itemMod,
+                                                name = entry.name,
+                                                cover = imageCoverFor(entry),
+                                                showPhotoThumb = true,
+                                                thumbRetryKey = refreshToken,
+                                                allowRemoteFetch = allowRemoteThumbs,
+                                                onClick = { openFolderImage(entry) },
+                                                onLongClick = { openExternalFile(entry.fileName) },
+                                                overflow = fileOverflow(entry.fileName),
+                                            )
+                                        } else {
+                                            BrowseFileGridItem(
+                                                modifier = itemMod,
+                                                name = entry.name,
+                                                onClick = { openExternalFile(entry.fileName) },
+                                                onLongClick = { openExternalFile(entry.fileName) },
+                                                overflow = fileOverflow(entry.fileName),
+                                            )
+                                        }
+                                    } else {
+                                        BrowseFileRow(
+                                            modifier = itemMod,
+                                            name = entry.name,
+                                            cover = if (isImage) imageCoverFor(entry) else null,
+                                            showPhotoThumb = isImage,
+                                            thumbRetryKey = refreshToken,
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            onClick = {
+                                                if (isImage) {
+                                                    openFolderImage(entry)
+                                                } else {
+                                                    openExternalFile(entry.fileName)
+                                                }
+                                            },
+                                            onLongClick = { openExternalFile(entry.fileName) },
+                                            fileName = entry.fileName,
+                                            sizeBytes = entry.size,
+                                            lastModifiedMs = entry.lastModifiedMs,
+                                            overflow = fileOverflow(entry.fileName),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (photoGrid) {
+                        val progressGid = stableGalleryId(sourceId, "webdav:$relativeDir")
+                        val gridState = rememberSmbPhotoGridState(
+                            sourceId = sourceId,
+                            relativeDir = "dav|$dirKey#pg",
+                            listMode = scrollLayoutKey,
+                            progressGid = progressGid,
+                            imageCount = folderImages.size,
+                        )
+                        val gridSpacing = GalleryGridDefaults.spacedBy()
+                        FastScrollLazyVerticalGrid(
+                            columns = GalleryGridDefaults.columns(),
+                            state = gridState,
+                            modifier = Modifier
+                                .nestedScroll(scrollBehavior.nestedScrollConnection)
+                                .fillMaxSize(),
+                            contentPadding = GalleryGridDefaults.contentPadding(),
+                            horizontalArrangement = gridSpacing,
+                            verticalArrangement = gridSpacing,
+                        ) {
+                            searchSection(grid = true)
+                            items(folderImages, key = { "pg-${it.fileName}" }) { file ->
+                                BrowsePhotoGridImageItem(
+                                    modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                    name = file.name,
+                                    cover = imageCoverFor(file),
+                                    showPhotoThumb = true,
+                                    allowRemoteFetch = allowRemoteThumbs,
+                                    onClick = { openFolderImage(file) },
+                                    onLongClick = { openExternalFile(file.fileName) },
+                                    overflow = fileOverflow(file.fileName),
+                                )
+                            }
+                        }
+                    } else if (useGrid) {
+                        val gridState = rememberSmbBrowseGridState(sourceId, "dav|$dirKey", scrollLayoutKey)
+                        val gridSpacing = GalleryGridDefaults.spacedBy()
+                        FastScrollLazyVerticalGrid(
+                            columns = GalleryGridDefaults.columns(),
+                            state = gridState,
+                            modifier = Modifier
+                                .nestedScroll(scrollBehavior.nestedScrollConnection)
+                                .fillMaxSize(),
+                            contentPadding = GalleryGridDefaults.contentPadding(),
+                            horizontalArrangement = gridSpacing,
+                            verticalArrangement = gridSpacing,
+                        ) {
+                            searchSection(grid = true)
+                            if (dirs.isNotEmpty()) {
+                                item(
+                                    key = "hdr-dirs",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_directories),
+                                        onClick = { toggleSection(BrowseFolderSection.Directories) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Directories !in collapsedSections) {
+                                    items(dirs, key = { "d-${it.relativeName}" }) { dir ->
+                                        BrowseDirectoryGridItem(
+                                            modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                            name = dir.name,
+                                            onClick = { enterDir(dir.relativeName) },
+                                            onLongClick = {
+                                                toggleDirFavorite(dir.relativeName, dir.coverFileName)
+                                            },
+                                            showFavoriteStar = isDirFavorite(dir.relativeName),
+                                            cover = dirCoverFor(dir),
+                                            showFolderThumb = browseFolderThumbs,
+                                            thumbRetryKey = refreshToken,
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            overflow = dirOverflow(dir.relativeName, dir.coverFileName),
+                                        )
+                                    }
+                                }
+                            }
+                            if (galleries.isNotEmpty()) {
+                                item(
+                                    key = "hdr-gal",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_galleries),
+                                        onClick = { toggleSection(BrowseFolderSection.Galleries) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Galleries !in collapsedSections) {
+                                    items(galleries, key = { galleryKey(it) }) { entry ->
+                                        when (entry) {
+                                            is BrowseEntryRemote.FolderGallery ->
+                                                BrowseFolderGalleryGridItem(
+                                                    modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                    name = entry.name,
+                                                    pageCount = entry.pageCount,
+                                                    pageCountCapped = entry.pageCountCapped,
+                                                    cover = coverFor(entry),
+                                                    thumbRetryKey = refreshToken,
+                                                    allowRemoteFetch = allowRemoteThumbs,
+                                                    showPages = showGalleryPages,
+                                                    onClick = { openFolderGalleryPrimary(entry) },
+                                                    onLongClick = { openFolderGallerySecondary(entry) },
+                                                    overflow = folderGalleryOverflow(entry),
+                                                )
+                                            is BrowseEntryRemote.ArchiveGallery ->
+                                                BrowseArchiveGridItem(
+                                                    modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                    name = entry.name,
+                                                    cover = archiveCoverFor(entry),
+                                                    thumbRetryKey = refreshToken,
+                                                    allowRemoteFetch = allowRemoteThumbs,
+                                                    onClick = { openArchive(entry) },
+                                                    onLongClick = { openArchiveInOtherApp(entry) },
+                                                    overflow = archiveOverflow(entry),
+                                                )
+                                            else -> Unit
+                                        }
+                                    }
+                                }
+                            }
+                            if (videos.isNotEmpty()) {
+                                item(
+                                    key = "hdr-vid",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_videos),
+                                        onClick = { toggleSection(BrowseFolderSection.Videos) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Videos !in collapsedSections) {
+                                    items(videos, key = { "v-${it.fileName}" }) { video ->
+                                        BrowseVideoGridItem(
+                                            modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                            name = video.name,
+                                            thumbnailSource = VideoThumbnailSource.WebDav(
+                                                sourceId = sourceId,
+                                                remoteRelativeFile = joinRemoteArchivePath(relativeDir, "", video.fileName),
+                                                knownSizeBytes = video.size,
+                                            ),
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            onClick = { openVideoPrimary(video.fileName) },
+                                            onLongClick = { openVideoSecondary(video.fileName) },
+                                            overflow = videoOverflow(video.fileName),
+                                        )
+                                    }
+                                }
+                            }
+                            if (files.isNotEmpty()) {
+                                item(
+                                    key = "hdr-files",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_files),
+                                        onClick = { toggleSection(BrowseFolderSection.Files) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Files !in collapsedSections) {
+                                    items(files, key = { "f-${it.fileName}" }) { file ->
+                                        val isImage = isImageFileName(file.fileName.substringAfterLast('/'))
+                                        if (isImage) {
+                                            BrowsePhotoGridImageItem(
+                                                modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                name = file.name,
+                                                cover = imageCoverFor(file),
+                                                showPhotoThumb = true,
+                                                allowRemoteFetch = allowRemoteThumbs,
+                                                onClick = { openFolderImage(file) },
+                                                onLongClick = { openExternalFile(file.fileName) },
+                                                overflow = fileOverflow(file.fileName),
+                                            )
+                                        } else {
+                                            BrowseFileGridItem(
+                                                modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                name = file.name,
+                                                onClick = { openExternalFile(file.fileName) },
+                                                onLongClick = { openExternalFile(file.fileName) },
+                                                overflow = fileOverflow(file.fileName),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        val listState = rememberSmbBrowseGridState(sourceId, "dav|$dirKey", scrollLayoutKey)
+                        FastScrollLazyVerticalGrid(
+                            columns = GalleryGridDefaults.listColumns(),
+                            state = listState,
+                            modifier = Modifier.nestedScroll(scrollBehavior.nestedScrollConnection).fillMaxSize(),
+                        ) {
+                            searchSection(grid = false)
+                            if (dirs.isNotEmpty()) {
+                                item(
+                                    key = "hdr-dirs",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_directories),
+                                        onClick = { toggleSection(BrowseFolderSection.Directories) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Directories !in collapsedSections) {
+                                    items(dirs, key = { "d-${it.relativeName}" }) { dir ->
+                                        BrowseDirectoryRow(
+                                            modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                            name = dir.name,
+                                            onClick = { enterDir(dir.relativeName) },
+                                            onLongClick = {
+                                                toggleDirFavorite(dir.relativeName, dir.coverFileName)
+                                            },
+                                            cover = dirCoverFor(dir),
+                                            showFolderThumb = browseFolderThumbs,
+                                            thumbRetryKey = refreshToken,
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            lastModifiedMs = dir.lastModifiedMs,
+                                            sizeBytes = dir.size,
+                                            typeLabel = browseZipAsDirTypeLabel(dir.relativeName, dir.name) ?: "Dir",
+                                            overflow = dirOverflow(dir.relativeName, dir.coverFileName),
+                                            showFavoriteStar = isDirFavorite(dir.relativeName),
+                                        )
+                                    }
+                                }
+                            }
+                            if (galleries.isNotEmpty()) {
+                                item(
+                                    key = "hdr-gal",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_galleries),
+                                        onClick = { toggleSection(BrowseFolderSection.Galleries) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Galleries !in collapsedSections) {
+                                    items(galleries, key = { galleryKey(it) }) { entry ->
+                                        when (entry) {
+                                            is BrowseEntryRemote.FolderGallery ->
+                                                BrowseFolderGalleryRow(
+                                                    modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                    name = entry.name,
+                                                    pageCount = entry.pageCount,
+                                                    pageCountCapped = entry.pageCountCapped,
+                                                    cover = coverFor(entry),
+                                                    thumbRetryKey = refreshToken,
+                                                    allowRemoteFetch = allowRemoteThumbs,
+                                                    showPages = showGalleryPages,
+                                                    onClick = { openFolderGalleryPrimary(entry) },
+                                                    onLongClick = { openFolderGallerySecondary(entry) },
+                                                    lastModifiedMs = entry.lastModifiedMs,
+                                                    sizeBytes = entry.size,
+                                                    typeLabel = browseZipAsDirTypeLabel(entry.relativeName, entry.name) ?: "Folder",
+                                                    overflow = folderGalleryOverflow(entry),
+                                                )
+                                            is BrowseEntryRemote.ArchiveGallery ->
+                                                BrowseArchiveGalleryRow(
+                                                    modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                                    name = entry.name,
+                                                    cover = archiveCoverFor(entry),
+                                                    thumbRetryKey = refreshToken,
+                                                    allowRemoteFetch = allowRemoteThumbs,
+                                                    onClick = { openArchive(entry) },
+                                                    onLongClick = { openArchiveInOtherApp(entry) },
+                                                    fileName = entry.fileName,
+                                                    sizeBytes = entry.size,
+                                                    lastModifiedMs = entry.lastModifiedMs,
+                                                    pageCount = entry.pageCount,
+                                                    showPages = showGalleryPages,
+                                                    overflow = archiveOverflow(entry),
+                                                )
+                                            else -> Unit
+                                        }
+                                    }
+                                }
+                            }
+                            if (videos.isNotEmpty()) {
+                                item(
+                                    key = "hdr-vid",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_videos),
+                                        onClick = { toggleSection(BrowseFolderSection.Videos) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Videos !in collapsedSections) {
+                                    items(videos, key = { "v-${it.fileName}" }) { video ->
+                                        BrowseVideoRow(
+                                            modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                            name = video.name,
+                                            thumbnailSource = VideoThumbnailSource.WebDav(
+                                                sourceId = sourceId,
+                                                remoteRelativeFile = joinRemoteArchivePath(relativeDir, "", video.fileName),
+                                                knownSizeBytes = video.size,
+                                            ),
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            onClick = { openVideoPrimary(video.fileName) },
+                                            onLongClick = { openVideoSecondary(video.fileName) },
+                                            fileName = video.fileName,
+                                            sizeBytes = video.size,
+                                            lastModifiedMs = video.lastModifiedMs,
+                                            overflow = videoOverflow(video.fileName),
+                                        )
+                                    }
+                                }
+                            }
+                            if (files.isNotEmpty()) {
+                                item(
+                                    key = "hdr-files",
+                                    span = { GridItemSpan(maxLineSpan) },
+                                ) {
+                                    BrowseSectionHeader(
+                                        stringResource(R.string.browse_files),
+                                        onClick = { toggleSection(BrowseFolderSection.Files) },
+                                    )
+                                }
+                                if (BrowseFolderSection.Files !in collapsedSections) {
+                                    items(files, key = { "f-${it.fileName}" }) { file ->
+                                        val isImage = isImageFileName(file.fileName.substringAfterLast('/'))
+                                        BrowseFileRow(
+                                            modifier = Modifier.thenIf(animateItems) { animateItem() },
+                                            name = file.name,
+                                            cover = if (isImage) imageCoverFor(file) else null,
+                                            showPhotoThumb = isImage,
+                                            allowRemoteFetch = allowRemoteThumbs,
+                                            onClick = {
+                                                if (isImage) {
+                                                    openFolderImage(file)
+                                                } else {
+                                                    openExternalFile(file.fileName)
+                                                }
+                                            },
+                                            onLongClick = { openExternalFile(file.fileName) },
+                                            fileName = file.fileName,
+                                            sizeBytes = file.size,
+                                            lastModifiedMs = file.lastModifiedMs,
+                                            overflow = fileOverflow(file.fileName),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

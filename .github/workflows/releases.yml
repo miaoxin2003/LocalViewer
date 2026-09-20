@@ -1,0 +1,108 @@
+name: Releases
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: main
+            suffix: default
+          - ref: easytier
+            suffix: easytier
+    steps:
+      - name: Free disk space
+        run: rm -rf $AGENT_TOOLSDIRECTORY
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version-file: .java-version
+
+      - name: Install Rust Toolchain
+        run: rustup target add thumbv7neon-linux-androideabi
+
+      # libavif LocalDav1d builds dav1d with meson (decode-only AV1 for PQ AVIF).
+      # nasm is required for x86_64 asm when -Denable_asm=true (arm64 uses gas).
+      - name: Install meson/nasm (dav1d)
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build nasm
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./app/src/main/rust"
+          key: ${{ matrix.ref }}
+
+      - name: CMake Cache
+        uses: actions/cache/restore@v5
+        with:
+          path: app/.cxx
+          key: cmake-${{ matrix.ref }}-
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-encryption-key: ${{ secrets.GradleEncryptionKey }}
+          cache-read-only: true
+
+      - name: Generate Baseline Profile
+        run: ./gradlew generateBaselineProfile
+          -Pandroid.testoptions.manageddevices.emulator.gpu="swiftshader_indirect"
+          -Prelease
+
+      - name: Build
+        run: ./gradlew assembleRelease
+          -Prelease
+
+      - name: Rename Apks (main)
+        if: matrix.suffix == 'default'
+        run: |
+          TAG="${{ github.ref_name }}"
+          mv app/build/outputs/apk/default/release/app-default-universal-release.apk LocalViewer-${TAG}-default-universal.apk
+          mv app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk LocalViewer-${TAG}-default-arm64-v8a.apk
+          mv app/build/outputs/apk/default/release/app-default-x86_64-release.apk LocalViewer-${TAG}-default-x86_64.apk
+          mv app/build/outputs/apk/default/release/app-default-armeabi-v7a-release.apk LocalViewer-${TAG}-default-armeabi-v7a.apk
+
+      - name: Rename Apks (easytier)
+        if: matrix.suffix == 'easytier'
+        run: |
+          TAG="${{ github.ref_name }}"
+          mv app/build/outputs/apk/default/release/app-default-arm64-v8a-release.apk LocalViewer-${TAG}-easytier-arm64-v8a.apk
+
+      - name: Releases (main)
+        if: matrix.suffix == 'default'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            LocalViewer-${{ github.ref_name }}-default-universal.apk
+            LocalViewer-${{ github.ref_name }}-default-arm64-v8a.apk
+            LocalViewer-${{ github.ref_name }}-default-x86_64.apk
+            LocalViewer-${{ github.ref_name }}-default-armeabi-v7a.apk
+
+      - name: Releases (easytier)
+        if: matrix.suffix == 'easytier'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            LocalViewer-${{ github.ref_name }}-easytier-arm64-v8a.apk

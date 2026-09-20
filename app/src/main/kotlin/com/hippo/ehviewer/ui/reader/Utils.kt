@@ -1,0 +1,137 @@
+package com.hippo.ehviewer.ui.reader
+
+import android.app.Activity
+import android.view.WindowManager
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.pager.PagerState
+import androidx.compose.runtime.Stable
+import androidx.compose.ui.AbsoluteAlignment
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.FixedScale
+import com.hippo.ehviewer.Settings
+import eu.kanade.tachiyomi.ui.reader.setting.OrientationType
+
+/**
+ * Forces the user preferred [orientation] on the activity.
+ */
+fun Activity.setOrientation(orientation: Int) {
+    val newOrientation = OrientationType.fromPreference(orientation)
+    if (newOrientation.flag != requestedOrientation) {
+        requestedOrientation = newOrientation.flag
+    }
+}
+
+/**
+ * Sets the brightness of the screen. Range is [-75, 100].
+ * From -75 to -1 a semi-transparent black view is overlaid with the minimum brightness.
+ * From 1 to 100 it sets that value as brightness.
+ * 0 sets system brightness and hides the overlay.
+ */
+fun Activity.setCustomBrightnessValue(value: Int) {
+    val readerBrightness = when {
+        value > 0 -> value / 100f
+        value < 0 -> 0.01f
+        else -> WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+    }
+
+    window.attributes = window.attributes.apply { screenBrightness = readerBrightness }
+}
+
+@Stable
+fun Alignment.Companion.fromPreferences(value: Int, isRtl: Boolean, isVertical: Boolean) = when (value) {
+    1 -> when {
+        isVertical -> CenterHorizontally
+        isRtl -> AbsoluteAlignment.Right
+        else -> AbsoluteAlignment.Left
+    }
+    2 -> AbsoluteAlignment.Left
+    3 -> AbsoluteAlignment.Right
+    else -> CenterHorizontally
+}
+
+@Stable
+fun ContentScale.Companion.fromPreferences(value: Int, srcSize: Size, dstSize: Size) = when (value) {
+    2 -> Crop
+    3 -> FillWidth
+    4 -> FillHeight
+    5 -> FixedScale(1 / Inside.computeScaleFactor(srcSize, dstSize).scaleX)
+    6 -> if (srcSize.width > srcSize.height) FillHeight else FillWidth
+    else -> Fit
+}
+
+suspend fun PagerState.performScrollToPage(page: Int) {
+    if (Settings.pageTransitions.value) {
+        animateScrollToPage(page)
+    } else {
+        scrollToPage(page)
+    }
+}
+
+suspend fun PagerState.moveToPrevious() {
+    val target = currentPage - 1
+    if (target >= 0) {
+        performScrollToPage(target)
+    }
+}
+
+suspend fun PagerState.moveToNext() {
+    val target = currentPage + 1
+    if (target < pageCount) {
+        performScrollToPage(target)
+    }
+}
+
+suspend fun LazyListState.performScrollBy(value: Float) {
+    if (Settings.pageTransitions.value) {
+        animateScrollBy(value)
+    } else {
+        scrollBy(value)
+    }
+}
+
+suspend fun LazyListState.scrollUp() {
+    performScrollBy(-scrollDistanceVertical)
+}
+
+suspend fun LazyListState.scrollDown() {
+    performScrollBy(scrollDistanceVertical)
+}
+
+/**
+ * Horizontal continuous (landscape dual webtoon): decrease list index.
+ * With reverseLayout RTL strip this is visual scroll toward the right (previous pages).
+ */
+suspend fun LazyListState.scrollLeft() {
+    performScrollBy(-scrollDistanceHorizontal)
+}
+
+/**
+ * Horizontal continuous: increase list index (next pages).
+ * With reverseLayout RTL strip this is visual scroll toward the left.
+ */
+suspend fun LazyListState.scrollRight() {
+    performScrollBy(scrollDistanceHorizontal)
+}
+
+private val LazyListState.scrollDistanceVertical
+    get() = layoutInfo.viewportSize.height * SCROLL_FRACTION
+
+private val LazyListState.scrollDistanceHorizontal
+    get() = layoutInfo.viewportSize.width * SCROLL_FRACTION
+
+/** Tap / volume-key scroll step as a fraction of the viewport. */
+const val SCROLL_FRACTION = 0.75f
+
+/**
+ * Lazy list keep-around window (fraction of viewport ahead + behind).
+ *
+ * Portrait webtoon: few tall items → [SCROLL_FRACTION] is cheap.
+ * Landscape dual strip: many narrow pages; with **Original** decode each is multi‑MP,
+ * so a large window pins 6–10 full-res textures and janks scroll. Keep a short window;
+ * [PageLoader] prefetch still warms neighbors without composing them.
+ */
+const val WEBTOON_HORIZONTAL_CACHE_FRACTION = 0.15f

@@ -1,0 +1,300 @@
+import com.mikepenz.aboutlibraries.plugin.DuplicateMode
+import com.mikepenz.aboutlibraries.plugin.DuplicateRule
+import java.util.regex.Pattern
+
+val isRelease: Boolean
+    get() = gradle.startParameter.taskNames.any { it.contains("Release") }
+
+plugins {
+    alias(libs.plugins.ehviewer.android.application)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.aboutlibraries)
+    alias(libs.plugins.aboutlibrariesAndroid)
+    alias(libs.plugins.baselineprofile)
+}
+
+// App ships all three ABIs in release; HDR *convert codecs* (jxr/avif/jxl/uhdr)
+// are only compiled into arm64-v8a + x86_64 (see CMake EHVIEWER_HDR_CODECS).
+// armeabi-v7a still gets libehviewer.so (archive/rust) with HDR JNI stubs.
+val supportedAbis = arrayOf("arm64-v8a", "x86_64", "armeabi-v7a")
+
+// GitHub release APKs: LocalViewer-<tag>-{default|easytier}-<abi>.apk
+// Product flavor stays "default"; channel identifies the installed build family.
+val releaseChannel = if (
+    file("src/main/jniLibs/arm64-v8a/libeasytier_android_jni.so").exists()
+) {
+    "easytier"
+} else {
+    "default"
+}
+
+android {
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            if (isRelease) {
+                // EasyTier release is arm64-only (matches GitHub asset naming).
+                if (releaseChannel == "easytier") {
+                    include("arm64-v8a")
+                    isUniversalApk = false
+                } else {
+                    include(*supportedAbis)
+                    isUniversalApk = true
+                }
+            } else {
+                include("arm64-v8a", "x86_64")
+            }
+        }
+    }
+
+    val signConfig = signingConfigs.create("release") {
+        storeFile = File(projectDir.path + "/keystore/androidkey.jks")
+        storePassword = "000000"
+        keyAlias = "key0"
+        keyPassword = "000000"
+        enableV3Signing = true
+        enableV4Signing = true
+    }
+
+    val commitSha = providers.exec {
+        commandLine = "git rev-parse --short=7 HEAD".split(' ')
+    }.standardOutput.asText.get().trim()
+
+    val commitTime = providers.exec {
+        commandLine = "git log -1 --format=%ct".split(' ')
+    }.standardOutput.asText.get().trim()
+
+    val repoName = providers.exec {
+        commandLine = "git remote get-url origin".split(' ')
+    }.standardOutput.asText.get().trim().removePrefix("https://github.com/").removePrefix("git@github.com:")
+        .removeSuffix(".git")
+
+    val snapshot = !hasProperty("release")
+
+    defaultConfig {
+        applicationId = "moe.tarsin.localviewer"
+        versionCode = 38
+        versionName = if (snapshot) {
+            "1.11.31-SNAPSHOT"
+        } else {
+            "1.11.31"
+        }
+        buildConfigField("boolean", "SNAPSHOT", "$snapshot")
+        buildConfigField("String", "RAW_VERSION_NAME", "\"$versionName\"")
+        buildConfigField("String", "COMMIT_SHA", "\"$commitSha\"")
+        buildConfigField("long", "COMMIT_TIME", commitTime)
+        buildConfigField("String", "REPO_NAME", "\"$repoName\"")
+        buildConfigField("String", "RELEASE_CHANNEL", "\"$releaseChannel\"")
+        ndk {
+            if (isRelease) {
+                if (releaseChannel != "easytier") {
+                    abiFilters.addAll(supportedAbis)
+                }
+            }
+            debugSymbolLevel = "FULL"
+        }
+    }
+
+    flavorDimensions += "api"
+
+    productFlavors {
+        create("default") {
+            minSdk = 31
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = File("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    compileOptions {
+        isCoreLibraryDesugaringEnabled = true
+    }
+
+    packaging {
+        dex {
+            useLegacyPackaging = false
+        }
+        jniLibs {
+            excludes += "**/libdatastore_shared_counter.so" // DataStore multi-process
+        }
+        resources {
+            // Required by Layout Inspector
+            pickFirsts += "/META-INF/androidx.compose.ui_ui.version"
+
+            excludes += listOf(
+                "/META-INF/**",
+                "/kotlin/**",
+                "**.txt",
+                "**.bin",
+            )
+        }
+    }
+
+    androidResources {
+        ignoreAssetsPatterns += listOf(
+            "!composepreference.preference.generated.resources",
+        )
+        generateLocaleConfig = true
+        localeFilters += listOf(
+            "zh",
+            "zh-rCN",
+            "zh-rHK",
+            "zh-rTW",
+            "es",
+            "ja",
+            "ko",
+            "fr",
+            "de",
+            "th",
+            "tr",
+            "nb-rNO",
+        )
+    }
+
+    dependenciesInfo.includeInApk = false
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles("proguard-rules.pro")
+            signingConfig = signConfig
+        }
+        debug {
+            applicationIdSuffix = ".debug"
+        }
+        create("benchmarkRelease") {
+            initWith(buildTypes.getByName("release"))
+            matchingFallbacks += listOf("release")
+            applicationIdSuffix = ".benchmark"
+            signingConfig = signingConfigs.getByName("debug")
+            isDebuggable = false
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+        compose = true
+    }
+
+    namespace = "com.hippo.ehviewer"
+}
+
+baselineProfile {
+    mergeIntoMain = true
+}
+
+dependencies {
+    implementation(projects.core.data)
+    implementation(projects.core.i18n)
+    implementation(projects.core.ui)
+
+    // https://developer.android.com/jetpack/androidx/releases/activity
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.biometric)
+    implementation(libs.androidx.browser)
+    implementation(libs.androidx.webkit)
+
+    implementation(libs.compose.destinations.core)
+    ksp(libs.compose.destinations.compiler)
+
+    implementation(libs.compose.preference) {
+        // R8 won't remove it because it adds a content provider
+        exclude(group = "org.jetbrains.compose.components", module = "components-resources")
+    }
+
+    implementation(libs.androidx.core)
+    implementation(libs.androidx.core.splashscreen)
+
+    implementation(libs.androidx.datastore)
+
+    // https://developer.android.com/jetpack/androidx/releases/lifecycle
+    implementation(libs.androidx.lifecycle.process)
+    implementation(libs.androidx.lifecycle.compose)
+
+    // https://developer.android.com/jetpack/androidx/releases/paging
+    implementation(libs.androidx.paging.compose)
+
+    // https://developer.android.com/jetpack/androidx/releases/room
+    implementation(libs.androidx.room.paging)
+
+    implementation(libs.smbj)
+    implementation(libs.zxing.core)
+    // Share enumeration: in-house [MsSrvsShareEnum] (NetrShareEnum over IPC$), no dcerpc.
+    testImplementation("junit:junit:4.13.2")
+    implementation(libs.material.motion.core)
+    implementation(libs.material.kolor)
+
+    implementation(libs.bundles.splitties)
+
+    implementation(libs.logcat)
+
+    implementation(libs.diff)
+
+    implementation(libs.aboutlibraries.core)
+    implementation(libs.aboutlibraries.compose.m3)
+
+    implementation(libs.reorderable)
+
+    implementation(platform(libs.arrow.stack))
+    implementation(libs.bundles.arrow)
+
+    // https://coil-kt.github.io/coil/changelog/
+    implementation(platform(libs.coil.bom))
+    implementation(libs.bundles.coil)
+
+    implementation(libs.telephoto.zoomable)
+
+    // Built-in video player (PlayerView controls); local/network via StreamDocumentProvider.
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
+
+    // Cronet (app HTTP) + Android HUC fallback.
+    implementation(libs.ktor.client.android)
+    // WebDAV PROPFIND: CIO HTTP/1.1, OkHttp HTTP/2 (Advanced toggle). Both accept custom methods.
+    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.okhttp)
+
+    implementation(libs.bundles.kotlinx.serialization)
+
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.datetime)
+
+    coreLibraryDesugaring(libs.desugar)
+
+    implementation(libs.androidx.profileinstaller)
+    "baselineProfile"(project(":benchmark"))
+
+    debugImplementation(libs.compose.ui.tooling)
+    implementation(libs.compose.ui.tooling.preview)
+}
+
+kotlin {
+    compilerOptions {
+        optIn.addAll(
+            "coil3.annotation.ExperimentalCoilApi",
+            "me.saket.telephoto.ExperimentalTelephotoApi",
+        )
+    }
+}
+
+ksp {
+    arg("compose-destinations.codeGenPackageName", "com.hippo.ehviewer.ui")
+}
+
+aboutLibraries {
+    collect {
+        includePlatform = false
+    }
+    library {
+        exclusionPatterns.add(Pattern.compile("org\\.jetbrains\\.(?:compose|androidx)\\..*"))
+        duplicationMode = DuplicateMode.MERGE
+        duplicationRule = DuplicateRule.GROUP
+    }
+}

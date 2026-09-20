@@ -1,0 +1,214 @@
+package com.hippo.ehviewer.coil
+
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorFilter
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.drawable.Animatable
+import android.graphics.drawable.Drawable
+import android.os.SystemClock
+import androidx.core.graphics.createBitmap
+import com.ehviewer.core.util.logcat
+import java.nio.ByteBuffer
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+
+// Hold a reference to the buffer as it's used by the decoder.
+// JNI GetDirectBufferAddress requires a direct buffer; ZIP/RAM pages are heap wraps.
+class AnimatedWebPDrawable(source: ByteBuffer) : Drawable(), Animatable {
+    private val source: ByteBuffer = source.ensureDirectForNative()
+    private val decodeScope = CoroutineScope(Dispatchers.IO.limitedParallelism(1))
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val decoder = nativeCreateDecoder(this.source)
+    private val width: Int
+    private val height: Int
+    private val loopCount: Int
+
+    private var decodeJob: Job? = null
+    private var loopsCompleted = 0
+    private var timeToShowNextFrame = 0L
+    private var currentFrame: Frame
+    private var nextFrame: Frame
+
+    init {
+        check(decoder != 0L) { "Failed to create decoder" }
+        val packed = nativeGetImageInfo(decoder)
+        width = (packed shr 40).toInt()
+        height = (packed shr 16 and 0xFFFFFF).toInt()
+        loopCount = (packed and 0xFFFF).toInt()
+        val bitmap = createBitmap(width, height)
+        val timestamp = nativeDecodeNextFrame(decoder, false, bitmap)
+        check(timestamp != 0) {
+            nativeDestroyDecoder(decoder)
+            "Failed to decode first frame"
+        }
+        currentFrame = Frame(bitmap, timestamp)
+        nextFrame = Frame(createBitmap(width, height), 0)
+    }
+
+    override fun getIntrinsicWidth() = width
+
+    override fun getIntrinsicHeight() = height
+
+    private val runnable = Runnable {
+        timeToShowNextFrame = SystemClock.uptimeMillis() + nextFrame.timestamp - currentFrame.timestamp
+        invalidateSelf()
+    }
+
+    private fun decodeNextFrame(reset: Boolean) = decodeScope.launch {
+        val timestamp = nativeDecodeNextFrame(decoder, reset, nextFrame.bitmap)
+        ensureActive()
+        check(timestamp != 0) {
+            decodeJob = null
+            "Failed to decode next frame"
+        }
+        if (timestamp <= currentFrame.timestamp) {
+            if (reset) loopsCompleted = 0 else loopsCompleted++
+            currentFrame.timestamp = 0
+        }
+        nextFrame.timestamp = timestamp
+        nextFrame.bitmap.prepareToDraw()
+    }.apply {
+        invokeOnCompletion { cause ->
+            when (cause) {
+                null -> scheduleSelf(
+                    runnable,
+                    animatedWebPInvalidateAt(
+                        reset = reset,
+                        now = SystemClock.uptimeMillis(),
+                        timeToShowNextFrame = timeToShowNextFrame,
+                    ),
+                )
+                !is CancellationException -> logcat(cause)
+            }
+        }
+    }
+
+    override fun draw(canvas: Canvas) {
+        if (decodeJob?.isCompleted == true && isVisible) {
+            decodeJob = if (loopCount == 0 || loopsCompleted < loopCount) {
+                currentFrame = nextFrame.also { nextFrame = currentFrame }
+                decodeNextFrame(false)
+            } else {
+                null
+            }
+        }
+        canvas.drawBitmap(currentFrame.bitmap, null, bounds, paint)
+    }
+
+    /**
+     * [AnimatedImageDrawable] resumes from [setVisible]; without this, a viewport
+     * fraction callback left WebP on a still frame until an unrelated redraw.
+     */
+    override fun setVisible(visible: Boolean, restart: Boolean): Boolean {
+        val changed = super.setVisible(visible, restart)
+        if (!changed && !restart) return false
+        when (
+            animatedWebPVisibleOp(
+                visible = visible,
+                restart = restart,
+                jobNull = decodeJob == null,
+            )
+        ) {
+            AnimatedWebPVisibleOp.PauseUnschedule -> unscheduleSelf(runnable)
+            AnimatedWebPVisibleOp.Restart -> {
+                stop()
+                start()
+            }
+            AnimatedWebPVisibleOp.ResumeInvalidate -> {
+                if (decodeJob == null) start() else invalidateSelf()
+            }
+        }
+        return changed
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
+
+    override fun setAlpha(alpha: Int) {
+        if (alpha != paint.alpha) {
+            paint.alpha = alpha
+            invalidateSelf()
+        }
+    }
+
+    override fun getAlpha(): Int = paint.alpha
+
+    override fun setColorFilter(colorFilter: ColorFilter?) {
+        if (colorFilter != paint.colorFilter) {
+            paint.colorFilter = colorFilter
+            invalidateSelf()
+        }
+    }
+
+    override fun getColorFilter(): ColorFilter? = paint.colorFilter
+
+    override fun isRunning() = decodeJob != null
+
+    override fun start() {
+        when {
+            decodeJob == null -> decodeJob = decodeNextFrame(true)
+            decodeJob?.isCompleted == true -> invalidateSelf()
+        }
+    }
+
+    override fun stop() {
+        decodeJob?.cancel()
+        decodeJob = null
+        unscheduleSelf(runnable)
+    }
+
+    fun dispose() {
+        stop()
+        runBlocking {
+            decodeScope.coroutineContext.job.cancelAndJoin()
+        }
+        nativeDestroyDecoder(decoder)
+        if (!currentFrame.bitmap.isRecycled) currentFrame.bitmap.recycle()
+        if (!nextFrame.bitmap.isRecycled) nextFrame.bitmap.recycle()
+    }
+}
+
+private class Frame(val bitmap: Bitmap, var timestamp: Int)
+
+/** What [AnimatedWebPDrawable.setVisible] should do so playback matches GIF/APNG. */
+internal enum class AnimatedWebPVisibleOp {
+    PauseUnschedule,
+    Restart,
+    ResumeInvalidate,
+}
+
+internal fun animatedWebPVisibleOp(
+    visible: Boolean,
+    restart: Boolean,
+    jobNull: Boolean,
+): AnimatedWebPVisibleOp = when {
+    !visible -> AnimatedWebPVisibleOp.PauseUnschedule
+    restart || jobNull -> AnimatedWebPVisibleOp.Restart
+    else -> AnimatedWebPVisibleOp.ResumeInvalidate
+}
+
+/** Decoder thread must [Drawable.scheduleSelf], never run the frame runnable inline. */
+internal fun animatedWebPInvalidateAt(reset: Boolean, now: Long, timeToShowNextFrame: Long): Long = if (reset) now else timeToShowNextFrame
+
+/** Native WebPAnimDecoder only accepts a direct buffer (capacity == readable range). */
+internal fun ByteBuffer.ensureDirectForNative(): ByteBuffer {
+    if (isDirect && position() == 0 && remaining() == capacity()) return this
+    val copy = ByteBuffer.allocateDirect(remaining())
+    copy.put(duplicate())
+    copy.flip()
+    return copy
+}
+
+private external fun nativeCreateDecoder(source: ByteBuffer): Long
+private external fun nativeGetImageInfo(decoder: Long): Long
+private external fun nativeDecodeNextFrame(decoder: Long, reset: Boolean, bitmap: Bitmap): Int
+private external fun nativeDestroyDecoder(decoder: Long)

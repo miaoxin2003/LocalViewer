@@ -1,0 +1,82 @@
+package com.hippo.ehviewer
+
+import android.app.UiModeManager
+import androidx.appcompat.app.AppCompatDelegate
+import arrow.core.Either.Companion.catch
+import com.ehviewer.core.preferences.PrefDelegate
+import com.ehviewer.core.util.logcat
+import com.ehviewer.core.util.withIOContext
+import com.hippo.ehviewer.library.VideoThumbnail
+import com.hippo.ehviewer.ui.keepNoMediaFileStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.emitAll
+import kotlinx.coroutines.launch
+import splitties.systemservices.uiModeManager
+
+private const val TAG = "SettingsCollector"
+
+private val collectScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+fun <T, R : PrefDelegate<T>> R.observed(func: suspend (T) -> Unit) = apply { collectScope.launch { valueFlow().drop(1).collectLatest(func) } }
+fun <T, R : Settings.Delegate<T>> R.emitTo(flow: MutableSharedFlow<Unit>) = apply { collectScope.launch { flow.emitAll(changesFlow()) } }
+fun <T, R : PrefDelegate<T>> R.emitTo(flow: MutableSharedFlow<Unit>) = apply { collectScope.launch { flow.emitAll(changesFlow()) } }
+
+suspend fun updateWhenKeepMediaStatusChanges(mediaScan: Boolean) {
+    withIOContext {
+        catch {
+            keepNoMediaFileStatus(mediaScan = mediaScan)
+        }.onLeft {
+            logcat(TAG, it)
+        }
+    }
+}
+
+/** Apply app night mode immediately (main thread). Used at process start and after pref changes. */
+fun applyNightMode(theme: Int) {
+    // minSdk 32: UiModeManager per-app night mode is always available.
+    val mode = when (theme) {
+        AppCompatDelegate.MODE_NIGHT_NO -> UiModeManager.MODE_NIGHT_NO
+        AppCompatDelegate.MODE_NIGHT_YES -> UiModeManager.MODE_NIGHT_YES
+        else -> UiModeManager.MODE_NIGHT_AUTO
+    }
+    uiModeManager.setApplicationNightMode(mode)
+    AppCompatDelegate.setDefaultNightMode(theme)
+}
+
+suspend fun updateWhenThemeChanges(theme: Int) {
+    delay(100) // Avoid recompose being cancelled when toggling from settings
+    applyNightMode(theme)
+}
+
+suspend fun updateWhenSaveFileMarkersChanges(enabled: Boolean) {
+    if (!enabled) {
+        withIOContext { VideoThumbnail.clearFailureMarkers() }
+    }
+}
+
+@Suppress("UNUSED_PARAMETER")
+fun updateWhenStreamKeepAliveUnlimitedChanges(enabled: Boolean) {
+    com.hippo.ehviewer.provider.StreamKeepAlivePolicy.onUnlimitedChanged()
+}
+
+/** Folder vs single-file HTTP tokens are incompatible — drop every loopback session. */
+@Suppress("UNUSED_PARAMETER")
+fun updateWhenExternalVideoAccessDirChanges(enabled: Boolean) {
+    com.hippo.ehviewer.provider.ExternalHttpStreamServer.removeAllSessions("access-dir=$enabled")
+}
+
+/** Stable vs random session tokens / ports — drop every loopback session. */
+@Suppress("UNUSED_PARAMETER")
+fun updateWhenExternalVideoRandomizeTokenChanges(enabled: Boolean) {
+    com.hippo.ehviewer.provider.ExternalHttpStreamServer.removeAllSessions("randomize-token=$enabled")
+}
+
+// Stubs for removed EH prefs still referenced by Settings property initializers
+fun updateWhenRequestNewsChanges() = Unit
+suspend fun updateWhenGallerySiteChanges(gallerySite: Int) = Unit
+fun updateWhenTagTranslationChanges(enabled: Boolean) = Unit

@@ -1,0 +1,17 @@
+.gradle
+/local.properties
+.DS_Store
+build
+.cxx
+.kotlin
+*.iml
+.idea
+.vscode
+/captures
+plan.md
+/HDR
+/cyberduck
+/newui
+/easytier
+/main2
+/app/src/main/rust

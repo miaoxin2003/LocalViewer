@@ -1,0 +1,330 @@
+package com.hippo.ehviewer.library
+
+import com.ehviewer.core.database.model.LOCAL_GALLERY_KIND_VIDEO_FILE
+import com.ehviewer.core.database.model.LocalGalleryEntity
+import kotlinx.coroutines.runBlocking
+import okio.Path.Companion.toPath
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class FolderGalleryIndexTest {
+    @Test
+    fun `self listing with empty relativeName is complete`() {
+        val names = listOf("01.jpg", "02.jpg")
+        val listing = listOf(gallery(relativeName = "", names = names))
+        assertEquals(
+            names,
+            FolderGalleryIndex.namesFromListing("share/gal", listing, "share/gal"),
+        )
+    }
+
+    @Test
+    fun `parent listing matches child gallery`() {
+        val names = listOf("a.png", "b.png")
+        val listing = listOf(gallery(relativeName = "gal", names = names))
+        assertEquals(
+            names,
+            FolderGalleryIndex.namesFromListing("share", listing, "share/gal"),
+        )
+    }
+
+    @Test
+    fun `promoted leaf is resolved from grandparent listing`() {
+        val names = listOf("leaf-1.jpg")
+        val listings = mapOf(
+            "share" to listOf(gallery(relativeName = "S/leaf", names = names)),
+        )
+        val found = runBlocking {
+            FolderGalleryIndex.namesWalkingParents("share/S/leaf") { listings[it] }
+        }
+        assertEquals(names, found)
+    }
+
+    @Test
+    fun `capped or empty index is ignored so live list can run`() {
+        val capped = gallery(relativeName = "gal", names = listOf("01.jpg"), capped = true)
+        val empty = gallery(relativeName = "gal", names = emptyList())
+        assertNull(FolderGalleryIndex.namesFromListing("share", listOf(capped), "share/gal"))
+        assertNull(FolderGalleryIndex.namesFromListing("share", listOf(empty), "share/gal"))
+    }
+
+    @Test
+    fun `walks to parent when self listing has no gallery row`() {
+        val names = listOf("page.webp")
+        val listings = mapOf(
+            "share/gal" to listOf(BrowseEntryRemote.RegularFile("note.txt")),
+            "share" to listOf(gallery(relativeName = "gal", names = names)),
+        )
+        val found = runBlocking {
+            FolderGalleryIndex.namesWalkingParents("share/gal") { listings[it] }
+        }
+        assertEquals(names, found)
+    }
+
+    @Test
+    fun `self listing image files are a complete index`() {
+        val listing = listOf(
+            BrowseEntryRemote.RegularFile("02.png"),
+            BrowseEntryRemote.RegularFile("01.png"),
+            BrowseEntryRemote.RegularFile("book.cbz"),
+        )
+        assertEquals(
+            listOf("01.png", "02.png"),
+            FolderGalleryIndex.namesFromListing("share/gal", listing, "share/gal"),
+        )
+    }
+
+    @Test
+    fun `sibling listing walks to grandparent for promoted leaf`() {
+        val listing = listOf(gallery(relativeName = "S/leaf", names = listOf("a.jpg")))
+        val found = runBlocking {
+            FolderGalleryIndex.siblingListingWalkingParents("share/S/leaf") { dir ->
+                if (dir == "share") listing else null
+            }
+        }
+        assertEquals("share", found?.first)
+        assertEquals(listing, found?.second)
+    }
+
+    @Test
+    fun `zip wrapper gallery is resolved from parent listing`() {
+        val names = listOf("a.jpg", "b.jpg")
+        val listing = listOf(gallery(relativeName = "pack.zip/Album", names = names))
+        assertEquals(
+            names,
+            FolderGalleryIndex.namesFromListing("share", listing, "share/pack.zip/Album"),
+        )
+    }
+
+    @Test
+    fun `zip interior listing matches child gallery`() {
+        val names = listOf("a.jpg")
+        val listings = mapOf(
+            "share/pack.zip" to listOf(gallery(relativeName = "Album", names = names)),
+        )
+        val found = runBlocking {
+            FolderGalleryIndex.namesWalkingParents("share/pack.zip/Album") { listings[it] }
+        }
+        assertEquals(names, found)
+    }
+
+    @Test
+    fun `root gallery matches empty listed dir`() {
+        val names = listOf("cover.jpg")
+        val listing = listOf(gallery(relativeName = "gal", names = names))
+        assertEquals(names, FolderGalleryIndex.namesFromListing("", listing, "gal"))
+    }
+
+    @Test
+    fun `complete names skip capped and empty so photo grid can live-list`() {
+        val names = listOf("b.jpg", "a.jpg")
+        val row = gallery(relativeName = "gal", names = names)
+        assertEquals(names, FolderGalleryIndex.completeNames(row))
+        assertNull(FolderGalleryIndex.completeNames(gallery(relativeName = "gal", names = names, capped = true)))
+        assertNull(FolderGalleryIndex.completeNames(gallery(relativeName = "gal", names = emptyList())))
+        assertEquals(
+            names,
+            FolderGalleryIndex.photoGridRemoteFiles(names).map { it.fileName },
+        )
+        val local = FolderGalleryIndex.photoGridLocalFiles("/tmp/gal", zipInnerRel = null, names)
+        assertEquals(names, local.map { it.name })
+        assertEquals("/tmp/gal/b.jpg", local.first().path.toString())
+        val zip = FolderGalleryIndex.photoGridLocalFiles("/tmp/pack.zip", zipInnerRel = "Album", names)
+        assertEquals("zipfile:/tmp/pack.zip!Album/b.jpg", zip.first().path.toString())
+    }
+
+    @Test
+    fun `browse uploader identity is root id and relative dir`() {
+        assertEquals(
+            7L to "share/gal",
+            FolderGalleryIndex.browseIdentityFromUploader("7\u0000share/gal"),
+        )
+        assertNull(FolderGalleryIndex.browseIdentityFromUploader(null))
+        assertNull(FolderGalleryIndex.browseIdentityFromUploader("norootid"))
+    }
+
+    @Test
+    fun `library root relative dir dot matches empty browse key`() {
+        assertEquals("", FolderGalleryIndex.normalizeGalleryRelativeDir("."))
+        assertEquals("gal", FolderGalleryIndex.normalizeGalleryRelativeDir("gal"))
+        val names = listOf("a.jpg", "b.jpg")
+        val listing = FolderGalleryIndex.listingFromImageNames("gal", names)
+        assertEquals(names, FolderGalleryIndex.namesFromListing("gal", listing, "gal"))
+        assertEquals(names, FolderGalleryIndex.completeNames(listing.filterIsInstance<BrowseEntryRemote.FolderGallery>().single()))
+    }
+
+    @Test
+    fun `video names overlay classified listing and stay media-pages-only`() {
+        val names = listOf("a.mp4", "b.mkv")
+        val listing = FolderGalleryIndex.listingFromVideoNames(names)
+        assertEquals(names, listing.map { it.name })
+        assertTrue(listing.all { it is BrowseEntryRemote.VideoFile })
+        assertTrue(FolderGalleryIndex.isImagePagesOnlyListing(listing))
+        val previous = listOf(
+            BrowseEntryRemote.Directory(
+                name = "Shows",
+                hasVideo = true,
+                hasGallery = false,
+                presence = DirPresence.Navigable,
+            ),
+            BrowseEntryRemote.VideoFile(name = "old.mp4", fileName = "old.mp4"),
+            BrowseEntryRemote.FolderGallery(
+                name = "gal",
+                relativeName = "",
+                pageCount = 1,
+                coverFileName = "cover.jpg",
+                imageFileNames = listOf("cover.jpg"),
+            ),
+        )
+        val merged = FolderGalleryIndex.mergeLibraryFolderVideos(previous, names)
+        assertEquals(names, merged.filterIsInstance<BrowseEntryRemote.VideoFile>().map { it.name })
+        assertTrue(merged.any { it is BrowseEntryRemote.Directory && it.name == "Shows" })
+        assertTrue(merged.any { it is BrowseEntryRemote.FolderGallery })
+        assertFalse(FolderGalleryIndex.isImagePagesOnlyListing(merged))
+        val both = FolderGalleryIndex.mergeLibraryFolderPages(merged, "gal", listOf("cover.jpg"))
+        assertTrue(both.any { it is BrowseEntryRemote.VideoFile && it.name == "a.mp4" })
+        assertEquals(
+            listOf("cover.jpg"),
+            both.filterIsInstance<BrowseEntryRemote.FolderGallery>().single().imageFileNames,
+        )
+        assertFalse(FolderGalleryIndex.isImagePagesOnlyListing(both))
+        val mediaOnly = FolderGalleryIndex.mergeLibraryFolderVideos(
+            FolderGalleryIndex.listingFromImageNames("gal", listOf("cover.jpg")),
+            names,
+        )
+        assertTrue(mediaOnly.any { it is BrowseEntryRemote.VideoFile && it.name == "a.mp4" })
+        assertTrue(FolderGalleryIndex.isImagePagesOnlyListing(mediaOnly))
+        val withSidecar = FolderGalleryIndex.mergeLibraryFolderVideos(
+            listOf(BrowseEntryRemote.RegularFile(name = "a.srt", fileName = "a.srt")),
+            names,
+        )
+        assertTrue(withSidecar.any { it is BrowseEntryRemote.RegularFile && it.name == "a.srt" })
+        assertEquals(names, withSidecar.filterIsInstance<BrowseEntryRemote.VideoFile>().map { it.name })
+    }
+
+    @Test
+    fun peekLocalRawChildrenReturnsRememberedFolderFiles() {
+        val key = "/tmp/Shows"
+        BrowseSession.invalidateLocalListing(key)
+        BrowseSession.rememberLocalRawChildren(key) {
+            listOf(
+                RemoteChild(name = "a.mp4", isDirectory = false),
+                RemoteChild(name = "a.srt", isDirectory = false),
+                RemoteChild(name = "Extra", isDirectory = true),
+            )
+        }
+        assertEquals(
+            listOf("a.mp4", "a.srt", "Extra"),
+            BrowseSession.peekLocalRawChildren(key)?.map { it.name },
+        )
+        BrowseSession.invalidateLocalListing(key)
+        assertNull(BrowseSession.peekLocalRawChildren(key))
+    }
+
+    @Test
+    fun `video names from listing skip promoted and other dirs`() {
+        val listing = listOf(
+            BrowseEntryRemote.VideoFile(name = "b.mkv", fileName = "b.mkv"),
+            BrowseEntryRemote.VideoFile(name = "a.mp4", fileName = "a.mp4"),
+            BrowseEntryRemote.VideoFile(name = "@S-leaf", fileName = "S/leaf/x.mp4"),
+            BrowseEntryRemote.RegularFile(name = "cover.jpg", fileName = "cover.jpg"),
+        )
+        assertEquals(
+            listOf("a.mp4", "b.mkv"),
+            FolderGalleryIndex.videoNamesFromListing("Shows", listing, "Shows"),
+        )
+        assertNull(FolderGalleryIndex.videoNamesFromListing("Shows", listing, "Shows/S"))
+        val files = FolderGalleryIndex.videoFolderLocalFiles("/tmp/Shows", listOf("a.mp4"))
+        assertEquals("a.mp4", files.single().name)
+        assertEquals("/tmp/Shows/a.mp4", files.single().path.toString())
+    }
+
+    @Test
+    fun `library db video rows map to folder overlay names`() {
+        val rows = listOf(
+            libVideoFile(id = 1, relativePath = "Shows/b.mkv", title = "b.mkv"),
+            libVideoFile(id = 2, relativePath = "Shows/a.mp4", title = "a.mp4"),
+            libVideoFile(id = 3, relativePath = "Shows/S/x.mp4", title = "x.mp4"),
+            libVideoFile(id = 4, relativePath = "a.mp4", title = "root.mp4"),
+            LocalGalleryEntity(
+                id = 5,
+                rootId = 1L,
+                relativePath = "Shows",
+                title = "Shows",
+                kind = com.ehviewer.core.database.model.LOCAL_GALLERY_KIND_VIDEO_FOLDER,
+                pageCount = 2,
+                coverPath = null,
+                contentPath = "/tmp/Shows",
+                mtime = 0L,
+            ),
+        )
+        assertEquals(
+            listOf("a.mp4", "b.mkv"),
+            FolderGalleryIndex.videoFileNamesFromLibraryRows("Shows", rows),
+        )
+        assertEquals(
+            listOf("a.mp4"),
+            FolderGalleryIndex.videoFileNamesFromLibraryRows(".", rows),
+        )
+        assertEquals(
+            listOf("x.mp4"),
+            FolderGalleryIndex.videoFileNamesFromLibraryRows("Shows/S", rows),
+        )
+        assertNull(FolderGalleryIndex.videoFileNamesFromLibraryRows("Other", rows))
+    }
+
+    @Test
+    fun `names from local parent ram listing match photo grid`() {
+        val names = listOf("01.jpg", "02.jpg")
+        val listing = listOf(gallery(relativeName = "gal", names = names))
+        val parent = "/tmp/share".toPath()
+        BrowseSession.putLocalFolderListing(
+            rootId = 1L,
+            relativeDir = "share",
+            entries = listing,
+            sessionCurrent = true,
+            pathAlias = parent,
+        )
+        assertEquals(
+            names,
+            FolderGalleryIndex.namesFromLocalParent(
+                rootId = 1L,
+                parentPath = parent.toString(),
+                parentRelative = "share",
+                galleryDir = "share/gal",
+            ),
+        )
+    }
+
+    private fun gallery(
+        relativeName: String,
+        names: List<String>,
+        capped: Boolean = false,
+    ) = BrowseEntryRemote.FolderGallery(
+        name = "Gal",
+        relativeName = relativeName,
+        pageCount = names.size,
+        pageCountCapped = capped,
+        coverFileName = names.firstOrNull(),
+        imageFileNames = names,
+    )
+
+    private fun libVideoFile(
+        id: Long,
+        relativePath: String,
+        title: String,
+    ) = LocalGalleryEntity(
+        id = id,
+        rootId = 1L,
+        relativePath = relativePath,
+        title = title,
+        kind = LOCAL_GALLERY_KIND_VIDEO_FILE,
+        pageCount = 0,
+        coverPath = null,
+        contentPath = "/tmp/$relativePath",
+        mtime = 0L,
+    )
+}
