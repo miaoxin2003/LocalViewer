@@ -99,6 +99,11 @@ fun AnimatedVisibilityScope.AboutScreen(navigator: DestinationsNavigator) = Scre
                 summary = author(),
             )
             UrlPreference(
+                title = stringResource(id = R.string.settings_about_original_author),
+                summary = stringResource(id = R.string.settings_about_original_author_summary),
+                url = "https://github.com/zmz125000/LocalViewer",
+            )
+            UrlPreference(
                 title = stringResource(id = R.string.settings_about_latest_release),
                 url = RELEASE_URL,
             )

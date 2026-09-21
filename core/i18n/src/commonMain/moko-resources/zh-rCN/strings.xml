@@ -611,6 +611,8 @@
     <string name="settings_about">关于</string>
     <string name="settings_about_declaration_summary">EhViewer 与 E-Hentai.org 无任何联系</string>
     <string name="settings_about_author">作者</string>
+    <string name="settings_about_original_author">致敬原作者 (zmz125000)</string>
+    <string name="settings_about_original_author_summary">本项目基于 zmz125000/LocalViewer 进行深度性能与体验优化。向原作者致以崇高敬意与由衷感谢！</string>
     <string name="settings_about_latest_release">最新版本</string>
     <string name="settings_about_source">源码</string>
     <string name="license">许可证</string>

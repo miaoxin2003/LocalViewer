@@ -52,12 +52,23 @@ internal object SmbCrypto {
         return CompositeSecurityProvider(jce, bc, mode)
     }
 
-    private class CompositeSecurityProvider(
+    internal class CompositeSecurityProvider(
         private val jce: SecurityProvider,
         private val bc: SecurityProvider,
         private val aesCmacMode: AesCmacMode,
     ) : SecurityProvider {
+        private val macs = ThreadLocal<HashMap<String, Mac>>()
+
         override fun getMac(name: String): Mac {
+            val key = name.lowercase()
+            val map = macs.get() ?: HashMap<String, Mac>(4).also { macs.set(it) }
+            map[key]?.let { return it }
+            val created = createMac(name)
+            map[key] = created
+            return created
+        }
+
+        private fun createMac(name: String): Mac {
             if (name.equals(AES_CMAC, ignoreCase = true)) {
                 return when (aesCmacMode) {
                     AesCmacMode.JCE_MAC -> jce.getMac(name)
