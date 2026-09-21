@@ -68,6 +68,10 @@
 9. **断点本地直通与网络瞬断自动重试**：
    - 退出应用重开时，首屏优先秒级穿透读取本地 `DocumentExtractCache` 磁盘已有文件，免除冷启动网络等待。
    - 针对 SMB / WebDAV 偶发丢包与微小网络抖动增加 3 次指数退避自动重试，杜绝页面被过早判定为永久错误态。
+10. **PDF 索引减色与非标格式深度兼容 (彻底解决特定漫画黑屏/无法加载)**：
+   - 彻底修复了原版中由 FreePic2Pdf / ComicEnhancerPro 等工具生成的 8-bit / 4-bit 索引减色（`/Indexed` Color Space）PDF 漫画在阅读时“除封面外后续全黑/死黑”的严重渲染 Bug。
+   - 实现了对 `/Indexed` 调色板（RGB/Gray/CMYK 基础色彩空间，支持 Stream 流引用与 String 内嵌调色板）的完整还原映射。
+   - 完善了 PNG 滤波器（Predictor 10~15）及非标嵌套 `/Resources` 字典的解引用容错，解决原版对多种常见网络扫图版 PDF 报错或判定“无有效图片”无法打开的问题。
 
 <div align="center">
   <h3>
